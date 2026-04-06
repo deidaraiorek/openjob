@@ -3,8 +3,11 @@
 .venv/
 __pycache__/
 *.pyc
+*.db
+*.egg-info/
 .pytest_cache/
 backend/.pytest_cache/
 frontend/node_modules/
 frontend/dist/
+*.tsbuildinfo
 coverage/
