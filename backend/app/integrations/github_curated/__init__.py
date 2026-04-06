@@ -1,0 +1,1 @@
+"""GitHub curated-list integration."""
