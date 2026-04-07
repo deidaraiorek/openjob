@@ -7,7 +7,6 @@ from app.domains.accounts.dependencies import get_current_account
 from app.domains.accounts.models import Account
 from app.domains.role_profiles.models import RoleProfile
 from app.db.session import get_db_session
-from app.integrations.openai.role_profile import expand_role_profile_prompt
 from app.tasks.job_relevance import rescore_account_jobs_now
 
 router = APIRouter(prefix="/role-profile", tags=["role-profile"])
@@ -54,12 +53,6 @@ def upsert_role_profile(
     current_account: Account = Depends(get_current_account),
     session: Session = Depends(get_db_session),
 ) -> RoleProfileResponse:
-    generated_titles = payload.generated_titles
-    if not generated_titles:
-        expanded = expand_role_profile_prompt(payload.prompt)
-        if not generated_titles:
-            generated_titles = expanded["generated_titles"]
-
     profile = session.scalar(
         select(RoleProfile).where(RoleProfile.account_id == current_account.id),
     )
@@ -68,7 +61,7 @@ def upsert_role_profile(
         session.add(profile)
 
     profile.prompt = payload.prompt
-    profile.generated_titles = generated_titles
+    profile.generated_titles = payload.generated_titles
     profile.generated_keywords = []
 
     session.commit()

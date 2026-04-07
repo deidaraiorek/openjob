@@ -7,9 +7,13 @@ from sqlalchemy.orm import Session
 
 from app.domains.jobs.deduplication import DiscoveryCandidate
 from app.domains.jobs.models import Job, JobRelevanceEvaluation
-from app.domains.jobs.title_matching import TitleMatchResult, match_title_against_catalog
 from app.domains.role_profiles.models import RoleProfile
-from app.integrations.openai.job_relevance import JobRelevanceResult, classify_job_relevance
+from app.integrations.openai.job_relevance import (
+    JobRelevanceBatchRequest,
+    JobRelevanceResult,
+    classify_job_relevance,
+)
+from app.integrations.openai.job_title_screening import classify_job_titles
 
 
 def profile_snapshot_hash(profile: RoleProfile | None) -> str | None:
@@ -18,7 +22,6 @@ def profile_snapshot_hash(profile: RoleProfile | None) -> str | None:
 
     payload = {
         "prompt": profile.prompt,
-        "generated_titles": profile.generated_titles,
     }
     encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -105,10 +108,15 @@ def cached_relevance_for_job(
 def evaluate_candidate_relevance(
     profile: RoleProfile | None,
     candidate: DiscoveryCandidate,
+    *,
+    screening: ScreenedTitle | None = None,
 ) -> JobRelevanceResult:
-    title_match = match_candidate_title(profile, candidate.title)
-    if not title_match.matched:
-        return title_gate_reject_result(title_match)
+    resolved_screening = screening
+    if resolved_screening is None:
+        title_screen = screen_candidate_titles(profile, [candidate])
+        resolved_screening = title_screen[candidate.title]
+    if resolved_screening.decision == "reject":
+        return title_screen_reject_result(candidate.title, resolved_screening)
 
     description_snippet = _extract_description_snippet(candidate, None)
     return classify_job_relevance(
@@ -119,7 +127,10 @@ def evaluate_candidate_relevance(
         source_type=candidate.source_type,
         apply_target_type=candidate.apply_target_type,
         description_snippet=description_snippet,
-        matched_titles=title_match.matched_titles,
+        matched_titles=[candidate.title],
+        title_screening_decision=resolved_screening.decision,
+        title_screening_summary=resolved_screening.summary,
+        title_screening_source=resolved_screening.source,
     )
 
 
@@ -154,9 +165,12 @@ def evaluate_job_relevance(
     if cached_result is not None:
         return cached_result
 
-    title_match = match_candidate_title(profile, job.title)
-    if not title_match.matched:
-        return title_gate_reject_result(title_match)
+    title_screen = screen_candidate_titles(profile, [candidate] if candidate else [])
+    screening = title_screen.get(job.title)
+    if screening is None and candidate is None:
+        screening = screen_candidate_title(profile, job.title)
+    if screening and screening.decision == "reject":
+        return title_screen_reject_result(job.title, screening)
 
     return classify_job_relevance(
         profile,
@@ -166,35 +180,164 @@ def evaluate_job_relevance(
         source_type=candidate.source_type if candidate else None,
         apply_target_type=preferred_target.target_type if preferred_target else None,
         description_snippet=description_snippet,
-        matched_titles=title_match.matched_titles,
+        matched_titles=[job.title],
+        title_screening_decision=screening.decision if screening else None,
+        title_screening_summary=screening.summary if screening else None,
+        title_screening_source=screening.source if screening else None,
     )
 
 
-def match_candidate_title(profile: RoleProfile | None, title: str) -> TitleMatchResult:
-    if not profile or not profile.generated_titles:
-        return TitleMatchResult(
-            matched=True,
-            normalized_title=title,
-            matched_titles=[],
-            summary="No generated title catalog is available, so the title stays eligible for AI review.",
+class ScreenedTitle:
+    __slots__ = ("title", "decision", "summary", "source", "model_name", "failure_cause", "payload")
+
+    def __init__(
+        self,
+        *,
+        title: str,
+        decision: str,
+        summary: str,
+        source: str,
+        model_name: str | None,
+        failure_cause: str | None,
+        payload: dict[str, object],
+    ) -> None:
+        self.title = title
+        self.decision = decision
+        self.summary = summary
+        self.source = source
+        self.model_name = model_name
+        self.failure_cause = failure_cause
+        self.payload = payload
+
+
+def screen_candidate_title(profile: RoleProfile | None, title: str) -> ScreenedTitle:
+    result = classify_job_titles(profile.prompt if profile else None, [title])
+    item = result.items[0]
+    return ScreenedTitle(
+        title=item.title,
+        decision=item.decision,
+        summary=item.summary,
+        source=result.source,
+        model_name=result.model_name,
+        failure_cause=result.failure_cause,
+        payload=result.payload,
+    )
+
+
+def screen_candidate_titles(
+    profile: RoleProfile | None,
+    candidates: list[DiscoveryCandidate],
+) -> dict[str, ScreenedTitle]:
+    titles = [candidate.title for candidate in candidates]
+    result = classify_job_titles(profile.prompt if profile else None, titles)
+    return {
+        item.title: ScreenedTitle(
+            title=item.title,
+            decision=item.decision,
+            summary=item.summary,
+            source=result.source,
+            model_name=result.model_name,
+            failure_cause=result.failure_cause,
+            payload=result.payload,
         )
-    return match_title_against_catalog(title, profile.generated_titles)
+        for item in result.items
+    }
 
 
-def title_gate_reject_result(match: TitleMatchResult) -> JobRelevanceResult:
+def title_screen_reject_result(title: str, screening: ScreenedTitle) -> JobRelevanceResult:
     return JobRelevanceResult(
         decision="reject",
         score=0.0,
-        summary=match.summary,
-        matched_signals=match.matched_titles,
-        concerns=["title gate"],
-        source="title_gate",
-        model_name=None,
-        failure_cause=None,
+        summary=screening.summary,
+        matched_signals=[title],
+        concerns=["title_screening"],
+        source="title_screening",
+        model_name=screening.model_name,
+        failure_cause=screening.failure_cause,
         payload={
-            "normalized_title": match.normalized_title,
-            "matched_titles": match.matched_titles,
+            "screening_decision": screening.decision,
+            "screening_summary": screening.summary,
+            "screening_source": screening.source,
+            "screening_payload": screening.payload,
         },
+    )
+
+
+def title_screen_review_result(title: str, screening: ScreenedTitle) -> JobRelevanceResult:
+    return JobRelevanceResult(
+        decision="review",
+        score=None,
+        summary=screening.summary,
+        matched_signals=[title],
+        concerns=["title_screening_review"],
+        source="title_screening",
+        model_name=screening.model_name,
+        failure_cause=screening.failure_cause,
+        payload={
+            "screening_decision": screening.decision,
+            "screening_summary": screening.summary,
+            "screening_source": screening.source,
+            "screening_payload": screening.payload,
+        },
+    )
+
+
+def queued_relevance_result(
+    title: str,
+    screening: ScreenedTitle,
+    *,
+    summary: str,
+    failure_cause: str,
+) -> JobRelevanceResult:
+    return JobRelevanceResult(
+        decision="review",
+        score=None,
+        summary=summary,
+        matched_signals=[title],
+        concerns=["queued_relevance"],
+        source="relevance_queue",
+        model_name=screening.model_name,
+        failure_cause=failure_cause,
+        payload={
+            "screening_decision": screening.decision,
+            "screening_summary": screening.summary,
+            "screening_source": screening.source,
+            "screening_payload": screening.payload,
+        },
+    )
+
+
+def build_batch_request_for_job(job: Job) -> JobRelevanceBatchRequest:
+    preferred_target = next((target for target in job.apply_targets if target.is_preferred), None)
+    latest_sighting = max(job.sightings, key=lambda item: item.id, default=None)
+    candidate = None
+    if latest_sighting is not None:
+        candidate = DiscoveryCandidate(
+            source_type=latest_sighting.source.source_type if latest_sighting.source else "unknown",
+            company_name=job.company_name,
+            title=job.title,
+            listing_url=latest_sighting.listing_url,
+            external_job_id=latest_sighting.external_job_id,
+            location=job.location,
+            apply_url=latest_sighting.apply_url,
+            apply_target_type=preferred_target.target_type if preferred_target else None,
+            raw_payload=latest_sighting.raw_payload,
+        )
+
+    latest_evaluation = job.relevance_evaluations[0] if job.relevance_evaluations else None
+    payload = latest_evaluation.payload if latest_evaluation is not None else {}
+
+    return JobRelevanceBatchRequest(
+        title=job.title,
+        company_name=job.company_name,
+        location=job.location,
+        source_type=candidate.source_type if candidate else None,
+        apply_target_type=preferred_target.target_type if preferred_target else None,
+        description_snippet=_extract_description_snippet(candidate, job),
+        matched_titles=[job.title],
+        title_screening_decision=payload.get("screening_decision"),
+        title_screening_summary=payload.get("screening_summary"),
+        title_screening_source=payload.get("screening_source"),
     )
 
 
@@ -238,6 +381,15 @@ def apply_relevance_result(
     evaluation_payload = dict(result.payload)
     evaluation_payload["job_fingerprint"] = fingerprint
     evaluation_payload["failure_cause"] = result.failure_cause
+    evaluation_payload["decision_phase"] = (
+        "title_screening"
+        if result.source == "title_screening"
+        else "full_relevance"
+        if result.source in {"ai", "system_fallback", "manual_include", "manual_exclude", "manual_review"}
+        else "relevance_queue"
+        if result.source == "relevance_queue"
+        else result.source
+    )
 
     evaluation = JobRelevanceEvaluation(
         account_id=account_id,

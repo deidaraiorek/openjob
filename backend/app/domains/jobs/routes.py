@@ -63,6 +63,7 @@ class JobRelevanceEvaluationResponse(BaseModel):
     concerns: list[str]
     model_name: str | None
     failure_cause: str | None
+    decision_phase: str | None
 
 
 class JobRelevanceUpdateRequest(BaseModel):
@@ -77,6 +78,7 @@ class JobRelevanceUpdateResponse(BaseModel):
     relevance_score: float | None
     relevance_summary: str | None
     relevance_failure_cause: str | None
+    relevance_decision_phase: str | None
 
 
 class JobRescoreResponse(BaseModel):
@@ -86,6 +88,7 @@ class JobRescoreResponse(BaseModel):
     relevance_score: float | None
     relevance_summary: str | None
     relevance_failure_cause: str | None
+    relevance_decision_phase: str | None
 
 
 class JobDetailResponse(BaseModel):
@@ -100,6 +103,7 @@ class JobDetailResponse(BaseModel):
     relevance_score: float | None
     relevance_summary: str | None
     relevance_failure_cause: str | None
+    relevance_decision_phase: str | None
     sightings: list[JobSightingResponse]
     preferred_apply_target: ApplyTargetResponse | None
     question_tasks: list[QuestionTaskSummary]
@@ -119,6 +123,7 @@ class JobListItemResponse(BaseModel):
     relevance_score: float | None
     relevance_summary: str | None
     relevance_failure_cause: str | None
+    relevance_decision_phase: str | None
     preferred_apply_target_type: str | None
     sighting_count: int
     open_question_task_count: int
@@ -174,6 +179,7 @@ def serialize_relevance_evaluation(
         concerns=evaluation.concerns,
         model_name=evaluation.model_name,
         failure_cause=evaluation.payload.get("failure_cause"),
+        decision_phase=evaluation.payload.get("decision_phase"),
     )
 
 
@@ -227,6 +233,12 @@ def effective_relevance_failure_cause(job: Job) -> str | None:
     return None
 
 
+def effective_relevance_decision_phase(job: Job) -> str | None:
+    if job.relevance_evaluations:
+        return job.relevance_evaluations[0].payload.get("decision_phase")
+    return None
+
+
 @router.get("", response_model=list[JobListItemResponse])
 def list_jobs(
     relevance: str = Query(default="active"),
@@ -235,7 +247,7 @@ def list_jobs(
 ) -> list[JobListItemResponse]:
     jobs = session.scalars(
         select(Job)
-        .where(Job.account_id == current_account.id, Job.status != "filtered_out")
+        .where(Job.account_id == current_account.id)
         .options(
             selectinload(Job.sightings),
             selectinload(Job.apply_targets),
@@ -271,6 +283,7 @@ def list_jobs(
                 relevance_score=effective_relevance_score(job),
                 relevance_summary=effective_relevance_summary(job),
                 relevance_failure_cause=effective_relevance_failure_cause(job),
+                relevance_decision_phase=effective_relevance_decision_phase(job),
                 preferred_apply_target_type=preferred_target.target_type if preferred_target else None,
                 sighting_count=len(job.sightings),
                 open_question_task_count=len(
@@ -336,6 +349,7 @@ def update_job_relevance(
         relevance_score=effective_relevance_score(job),
         relevance_summary=effective_relevance_summary(job),
         relevance_failure_cause=effective_relevance_failure_cause(job),
+        relevance_decision_phase=effective_relevance_decision_phase(job),
     )
 
 
@@ -357,6 +371,7 @@ def rescore_job_route(
         relevance_score=effective_relevance_score(job),
         relevance_summary=effective_relevance_summary(job),
         relevance_failure_cause=effective_relevance_failure_cause(job),
+        relevance_decision_phase=effective_relevance_decision_phase(job),
     )
 
 
@@ -397,6 +412,7 @@ def get_job_detail(
         relevance_score=effective_relevance_score(job),
         relevance_summary=effective_relevance_summary(job),
         relevance_failure_cause=effective_relevance_failure_cause(job),
+        relevance_decision_phase=effective_relevance_decision_phase(job),
         sightings=[serialize_sighting(sighting) for sighting in sorted(job.sightings, key=lambda item: item.id)],
         preferred_apply_target=serialize_apply_target(preferred_target) if preferred_target else None,
         question_tasks=[

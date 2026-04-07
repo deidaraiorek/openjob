@@ -7,29 +7,30 @@ from app.domains.sources.models import JobSource
 from app.tasks.discovery import sync_source
 
 
-def test_sync_source_ingests_greenhouse_jobs_and_expands_role_profile(db_session, monkeypatch) -> None:
-    from app.integrations.openai.job_relevance import JobRelevanceResult
-
+def test_sync_source_ingests_greenhouse_jobs_and_queues_pass_titles(db_session, monkeypatch) -> None:
+    queued: dict[str, object] = {}
     monkeypatch.setattr(
-        "app.tasks.discovery.expand_role_profile_prompt",
-        lambda prompt: {
-            "generated_titles": ["Software Engineer I", "Backend Engineer"],
-            "generated_keywords": [],
+        "app.tasks.discovery.screen_candidate_titles",
+        lambda profile, candidates: {
+            candidate.title: type(
+                "ScreenedTitle",
+                (),
+                {
+                    "title": candidate.title,
+                    "decision": "pass",
+                    "summary": "Relevant title.",
+                    "source": "ai",
+                    "model_name": "groq-test",
+                    "failure_cause": None,
+                    "payload": {},
+                },
+            )()
+            for candidate in candidates
         },
     )
     monkeypatch.setattr(
-        "app.tasks.discovery.evaluate_candidate_relevance",
-        lambda profile, candidate: JobRelevanceResult(
-            decision="match",
-            score=0.95,
-            summary="Strong match.",
-            matched_signals=["software engineer i"],
-            concerns=[],
-            source="ai",
-            model_name="groq-test",
-            failure_cause=None,
-            payload={},
-        ),
+        "app.tasks.discovery.evaluate_job_batch_now",
+        lambda session, account_id, job_ids: queued.update({"account_id": account_id, "job_ids": list(job_ids)}) or len(job_ids),
     )
 
     account = ensure_account(db_session, "owner@example.com")
@@ -74,17 +75,22 @@ def test_sync_source_ingests_greenhouse_jobs_and_expands_role_profile(db_session
     assert job_count == 1
     assert sighting_count == 1
     assert target_count == 1
-    assert "Software Engineer I" in profile.generated_titles
+    assert profile.generated_titles == []
     assert profile.generated_keywords == []
     target = db_session.scalar(select(ApplyTarget))
+    job = db_session.scalar(select(Job))
+    assert job is not None
     assert target is not None
+    assert job.relevance_decision == "review"
+    assert job.relevance_source == "relevance_queue"
+    assert "queued for deeper ai relevance review" in (job.relevance_summary or "").lower()
     assert target.metadata_json["board_token"] == "acme"
     assert target.metadata_json["job_post_id"] == "123"
+    assert queued == {"account_id": account.id, "job_ids": [job.id]}
 
 
-def test_sync_source_filters_irrelevant_titles_from_software_profile(db_session, monkeypatch) -> None:
-    from app.integrations.openai.job_relevance import JobRelevanceResult
-
+def test_sync_source_treats_non_reject_title_screen_results_as_phase_two_candidates(db_session, monkeypatch) -> None:
+    queued_job_ids: list[int] = []
     account = ensure_account(db_session, "owner@example.com")
     source = JobSource(
         account_id=account.id,
@@ -104,32 +110,37 @@ def test_sync_source_filters_irrelevant_titles_from_software_profile(db_session,
     db_session.commit()
     db_session.refresh(source)
 
-    def fake_result(profile, candidate):
-        if candidate.title == "Software Engineer 1":
-            return JobRelevanceResult(
-                decision="match",
-                score=0.94,
-                summary="Relevant early-career software role.",
-                matched_signals=["software engineer 1"],
-                concerns=[],
-                source="ai",
-                model_name="groq-test",
-                failure_cause=None,
-                payload={},
-            )
-        return JobRelevanceResult(
-            decision="reject",
-            score=0.03,
-            summary="Hardware role is outside the role profile.",
-            matched_signals=[],
-            concerns=["hardware"],
-            source="ai",
-            model_name="groq-test",
-            failure_cause=None,
-            payload={},
-        )
-
-    monkeypatch.setattr("app.tasks.discovery.evaluate_candidate_relevance", fake_result)
+    monkeypatch.setattr(
+        "app.tasks.discovery.screen_candidate_titles",
+        lambda profile, candidates: {
+            candidate.title: type(
+                "ScreenedTitle",
+                (),
+                {
+                    "title": candidate.title,
+                    "decision": (
+                        "pass"
+                        if candidate.title == "Software Engineer 1"
+                        else "review"
+                    ),
+                    "summary": (
+                        "Looks like a relevant software role."
+                        if candidate.title == "Software Engineer 1"
+                        else "Title is ambiguous and should stay in review."
+                    ),
+                    "source": "ai",
+                    "model_name": "groq-test",
+                    "failure_cause": None,
+                    "payload": {},
+                },
+            )()
+            for candidate in candidates
+        },
+    )
+    monkeypatch.setattr(
+        "app.tasks.discovery.evaluate_job_batch_now",
+        lambda session, account_id, job_ids: queued_job_ids.extend(job_ids) or len(job_ids),
+    )
 
     markdown = """
 <table>
@@ -153,14 +164,15 @@ def test_sync_source_filters_irrelevant_titles_from_software_profile(db_session,
     summary = sync_source(db_session, source.id, raw_payload=markdown)
 
     jobs = db_session.scalars(select(Job).order_by(Job.id.asc())).all()
-    assert summary == {"processed": 2, "created": 1, "updated": 0}
-    assert [job.title for job in jobs] == ["Software Engineer 1"]
-    assert [job.relevance_decision for job in jobs] == ["match"]
+    assert summary == {"processed": 2, "created": 2, "updated": 0}
+    assert [job.title for job in jobs] == ["Software Engineer 1", "Hardware Engineer"]
+    assert jobs[0].relevance_source == "relevance_queue"
+    assert jobs[1].relevance_source == "relevance_queue"
+    assert queued_job_ids == [jobs[0].id, jobs[1].id]
 
 
-def test_sync_source_does_not_treat_engineer_two_as_engineer_one(db_session, monkeypatch) -> None:
-    from app.integrations.openai.job_relevance import JobRelevanceResult
-
+def test_sync_source_does_not_queue_title_screen_rejects(db_session, monkeypatch) -> None:
+    queued_job_ids: list[int] = []
     account = ensure_account(db_session, "owner@example.com")
     source = JobSource(
         account_id=account.id,
@@ -180,32 +192,29 @@ def test_sync_source_does_not_treat_engineer_two_as_engineer_one(db_session, mon
     db_session.commit()
     db_session.refresh(source)
 
-    def fake_result(profile, candidate):
-        if candidate.title == "Software Engineer I":
-            return JobRelevanceResult(
-                decision="match",
-                score=0.97,
-                summary="Exact early-career software match.",
-                matched_signals=["software engineer i"],
-                concerns=[],
-                source="ai",
-                model_name="groq-test",
-                failure_cause=None,
-                payload={},
-            )
-        return JobRelevanceResult(
-            decision="reject",
-            score=0.08,
-            summary="Not an entry-level software engineer role.",
-            matched_signals=[],
-            concerns=["seniority mismatch", "site reliability focus"],
-            source="ai",
-            model_name="groq-test",
-            failure_cause=None,
-            payload={},
-        )
-
-    monkeypatch.setattr("app.tasks.discovery.evaluate_candidate_relevance", fake_result)
+    monkeypatch.setattr(
+        "app.tasks.discovery.screen_candidate_titles",
+        lambda profile, candidates: {
+            candidate.title: type(
+                "ScreenedTitle",
+                (),
+                {
+                    "title": candidate.title,
+                    "decision": "pass" if candidate.title == "Software Engineer I" else "reject",
+                    "summary": "Screened.",
+                    "source": "ai",
+                    "model_name": "groq-test",
+                    "failure_cause": None,
+                    "payload": {},
+                },
+            )()
+            for candidate in candidates
+        },
+    )
+    monkeypatch.setattr(
+        "app.tasks.discovery.evaluate_job_batch_now",
+        lambda session, account_id, job_ids: queued_job_ids.extend(job_ids) or len(job_ids),
+    )
 
     payload = {
         "company_name": "Ping Identity",
@@ -228,27 +237,40 @@ def test_sync_source_does_not_treat_engineer_two_as_engineer_one(db_session, mon
     summary = sync_source(db_session, source.id, raw_payload=payload)
     jobs = db_session.scalars(select(Job).order_by(Job.id.asc())).all()
 
-    assert summary == {"processed": 2, "created": 1, "updated": 0}
-    assert [job.title for job in jobs] == ["Software Engineer I"]
-    assert [job.relevance_decision for job in jobs] == ["match"]
+    assert summary == {"processed": 2, "created": 2, "updated": 0}
+    assert [job.title for job in jobs] == [
+        "Site Reliability Engineer II - Government Cloud",
+        "Software Engineer I",
+    ]
+    assert jobs[0].relevance_decision == "reject"
+    assert jobs[0].relevance_source == "title_screening"
+    assert jobs[1].relevance_source == "relevance_queue"
+    assert queued_job_ids == [jobs[1].id]
 
 
 def test_sync_source_derives_greenhouse_board_token_from_base_url(db_session, monkeypatch) -> None:
-    from app.integrations.openai.job_relevance import JobRelevanceResult
-
     monkeypatch.setattr(
-        "app.tasks.discovery.evaluate_candidate_relevance",
-        lambda profile, candidate: JobRelevanceResult(
-            decision="match",
-            score=0.9,
-            summary="Relevant role.",
-            matched_signals=["software engineer"],
-            concerns=[],
-            source="ai",
-            model_name="groq-test",
-            failure_cause=None,
-            payload={},
-        ),
+        "app.tasks.discovery.screen_candidate_titles",
+        lambda profile, candidates: {
+            candidate.title: type(
+                "ScreenedTitle",
+                (),
+                {
+                    "title": candidate.title,
+                    "decision": "pass",
+                    "summary": "Relevant title.",
+                    "source": "ai",
+                    "model_name": "groq-test",
+                    "failure_cause": None,
+                    "payload": {},
+                },
+            )()
+            for candidate in candidates
+        },
+    )
+    monkeypatch.setattr(
+        "app.tasks.discovery.evaluate_job_batch_now",
+        lambda session, account_id, job_ids: len(job_ids),
     )
 
     account = ensure_account(db_session, "owner@example.com")
@@ -282,3 +304,77 @@ def test_sync_source_derives_greenhouse_board_token_from_base_url(db_session, mo
     assert summary == {"processed": 1, "created": 1, "updated": 0}
     assert target is not None
     assert target.metadata_json["board_token"] == "alt"
+
+
+def test_sync_source_queues_all_pass_titles_for_phase_two(db_session, monkeypatch) -> None:
+    queued_job_ids: list[int] = []
+
+    monkeypatch.setattr(
+        "app.tasks.discovery.screen_candidate_titles",
+        lambda profile, candidates: {
+            candidate.title: type(
+                "ScreenedTitle",
+                (),
+                {
+                    "title": candidate.title,
+                    "decision": "pass",
+                    "summary": "Relevant title.",
+                    "source": "ai",
+                    "model_name": "groq-test",
+                    "failure_cause": None,
+                    "payload": {},
+                },
+            )()
+            for candidate in candidates
+        },
+    )
+    monkeypatch.setattr(
+        "app.tasks.discovery.evaluate_job_batch_now",
+        lambda session, account_id, job_ids: queued_job_ids.extend(job_ids) or len(job_ids),
+    )
+
+    account = ensure_account(db_session, "owner@example.com")
+    source = JobSource(
+        account_id=account.id,
+        source_key="cap-test",
+        source_type="greenhouse_board",
+        name="Cap Test",
+        base_url="https://boards.greenhouse.io/cap",
+        settings_json={"board_token": "cap"},
+    )
+    profile = RoleProfile(
+        account_id=account.id,
+        prompt="software engineer new grad",
+        generated_titles=[],
+        generated_keywords=[],
+    )
+    db_session.add_all([source, profile])
+    db_session.commit()
+    db_session.refresh(source)
+
+    payload = {
+        "company_name": "Cap Co",
+        "jobs": [
+            {
+                "id": 1,
+                "title": "Software Engineer I",
+                "absolute_url": "https://boards.greenhouse.io/cap/jobs/1",
+                "location": {"name": "Remote"},
+            },
+            {
+                "id": 2,
+                "title": "New Grad Software Engineer",
+                "absolute_url": "https://boards.greenhouse.io/cap/jobs/2",
+                "location": {"name": "Remote"},
+            },
+        ],
+    }
+
+    sync_source(db_session, source.id, raw_payload=payload)
+    jobs = db_session.scalars(select(Job).order_by(Job.id.asc())).all()
+
+    assert len(queued_job_ids) == 2
+    assert jobs[0].relevance_source == "relevance_queue"
+    assert jobs[1].relevance_source == "relevance_queue"
+    assert "queued for deeper ai relevance review" in (jobs[0].relevance_summary or "").lower()
+    assert "queued for deeper ai relevance review" in (jobs[1].relevance_summary or "").lower()

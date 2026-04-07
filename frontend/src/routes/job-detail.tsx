@@ -8,7 +8,16 @@ function formatFailureCause(value: string | null): string | null {
   if (!value) {
     return null;
   }
-  return value.replaceAll("_", " ");
+  const labels: Record<string, string | null> = {
+    title_screening_review: null,
+    provider_rate_limited: "AI provider was rate-limited",
+    provider_timeout: "AI request timed out",
+    provider_unavailable: "AI service is temporarily unavailable",
+    provider_response_invalid: "AI response was invalid",
+    config_missing: "AI provider is not configured",
+    queued_for_async_relevance: null,
+  };
+  return labels[value] ?? value.replaceAll("_", " ");
 }
 
 export function JobDetailRoute() {
@@ -97,8 +106,8 @@ export function JobDetailRoute() {
               Relevance: {job.relevance_decision}
               {job.relevance_score !== null ? ` (${Math.round(job.relevance_score * 100)}%)` : ""}
             </p>
-            {job.relevance_failure_cause ? (
-              <p className="muted-copy">System issue: {formatFailureCause(job.relevance_failure_cause)}</p>
+            {formatFailureCause(job.relevance_failure_cause) ? (
+              <p className="muted-copy">Temporary issue: {formatFailureCause(job.relevance_failure_cause)}</p>
             ) : null}
             <p className="supporting-copy">{job.relevance_summary ?? "No relevance rationale stored yet."}</p>
           </div>
@@ -194,8 +203,8 @@ export function JobDetailRoute() {
                       {evaluation.source}
                       {evaluation.model_name ? ` • ${evaluation.model_name}` : ""}
                     </span>
-                    {evaluation.failure_cause ? (
-                      <span>System issue: {formatFailureCause(evaluation.failure_cause)}</span>
+                    {formatFailureCause(evaluation.failure_cause) ? (
+                      <span>Temporary issue: {formatFailureCause(evaluation.failure_cause)}</span>
                     ) : null}
                   </li>
                 ))}

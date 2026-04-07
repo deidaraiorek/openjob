@@ -96,24 +96,15 @@ export function AnswersRoute() {
 
         <article className="panel-card">
           <h2>{editingAnswerId !== null ? "Edit answer" : "Add answer"}</h2>
+          <p className="supporting-copy">
+            Template links are attached automatically when you save an answer from the Questions screen.
+          </p>
           <form className="form-grid" onSubmit={handleSubmit}>
             <label>
               <span>Label</span>
               <input
                 value={form.label}
                 onChange={(event) => setForm((current) => ({ ...current, label: event.target.value }))}
-              />
-            </label>
-            <label>
-              <span>Question template ID</span>
-              <input
-                value={form.question_template_id ?? ""}
-                onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    question_template_id: event.target.value ? Number(event.target.value) : null,
-                  }))
-                }
               />
             </label>
             <label className="full-width">

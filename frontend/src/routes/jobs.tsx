@@ -8,7 +8,58 @@ function formatFailureCause(value: string | null): string | null {
   if (!value) {
     return null;
   }
-  return value.replaceAll("_", " ");
+  const labels: Record<string, string | null> = {
+    title_screening_review: null,
+    provider_rate_limited: "AI provider was rate-limited",
+    provider_timeout: "AI request timed out",
+    provider_unavailable: "AI service is temporarily unavailable",
+    provider_response_invalid: "AI response was invalid",
+    config_missing: "AI provider is not configured",
+    queued_for_async_relevance: null,
+  };
+  return labels[value] ?? value.replaceAll("_", " ");
+}
+
+function formatLabel(value: string | null, fallback = "None"): string {
+  if (!value) {
+    return fallback;
+  }
+
+  return value
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function formatLatestRun(job: JobListItem): string {
+  if (!job.latest_application_run_status) {
+    return "No runs yet";
+  }
+
+  return formatLabel(job.latest_application_run_status);
+}
+
+function getJobActionConfig(job: JobListItem): {
+  primaryAction: { label: string; decision: "match" | "reject"; className: string };
+  secondaryAction: { label: string; decision: "match" | "reject"; className: string } | null;
+} {
+  if (job.relevance_decision === "reject") {
+    return {
+      primaryAction: { label: "Include", decision: "match", className: "secondary-button" },
+      secondaryAction: null,
+    };
+  }
+
+  if (job.relevance_decision === "match") {
+    return {
+      primaryAction: { label: "Exclude", decision: "reject", className: "ghost-button" },
+      secondaryAction: null,
+    };
+  }
+
+  return {
+    primaryAction: { label: "Include", decision: "match", className: "secondary-button" },
+    secondaryAction: { label: "Exclude", decision: "reject", className: "ghost-button" },
+  };
 }
 
 export function JobsRoute() {
@@ -82,7 +133,6 @@ export function JobsRoute() {
               { key: "match", label: "Match" },
               { key: "review", label: "Review" },
               { key: "reject", label: "Reject" },
-              { key: "all", label: "All" },
             ].map((option) => (
               <button
                 key={option.key}
@@ -100,79 +150,93 @@ export function JobsRoute() {
         {jobs.length === 0 ? (
           <p className="empty-copy">No jobs are stored yet.</p>
         ) : (
-          <div className="table-shell">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Company</th>
-                  <th>Title</th>
-                  <th>Status</th>
-                  <th>Relevance</th>
-                  <th>Apply path</th>
-                  <th>Sightings</th>
-                  <th>Questions</th>
-                  <th>Latest run</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {jobs.map((job) => (
-                  <tr key={job.id}>
-                    <td>
-                      <Link className="table-link" to={`/jobs/${job.id}`}>
-                        {job.company_name}
+          <div className="job-board">
+            {jobs.map((job) => {
+              const actionConfig = getJobActionConfig(job);
+              const secondaryAction = actionConfig.secondaryAction;
+
+              return (
+                <article key={job.id} className={`job-card job-card-${job.relevance_decision}`}>
+                  <div className="job-card-main">
+                    <div className="job-card-title-group">
+                      <p className="job-company-label">{job.company_name}</p>
+                      <Link
+                        className="job-title-link"
+                        to={`/jobs/${job.id}`}
+                        aria-label={`${job.company_name} ${job.title}`}
+                      >
+                        {job.title}
                       </Link>
-                    </td>
-                    <td>{job.title}</td>
-                    <td>{job.status}</td>
-                    <td>
-                      <div className="table-meta">
-                        <strong>{job.relevance_decision}</strong>
-                        <span>{job.relevance_summary ?? "No rationale yet"}</span>
-                        {job.relevance_failure_cause ? (
-                          <span>System issue: {formatFailureCause(job.relevance_failure_cause)}</span>
-                        ) : null}
-                      </div>
-                    </td>
-                    <td>{job.preferred_apply_target_type ?? "None"}</td>
-                    <td>{job.sighting_count}</td>
-                    <td>{job.open_question_task_count}</td>
-                    <td>{job.latest_application_run_status ?? "No runs yet"}</td>
-                    <td>
-                      <div className="button-row compact-row">
-                        <button
-                          type="button"
-                          className="ghost-button"
-                          disabled={updatingJobId === job.id}
-                          onClick={() => void handleRelevanceUpdate(job, "match")}
-                        >
-                          Include
-                        </button>
-                        <button
-                          type="button"
-                          className="ghost-button"
-                          disabled={updatingJobId === job.id}
-                          onClick={() => void handleRelevanceUpdate(job, "reject")}
-                        >
-                          Exclude
-                        </button>
-                        {job.preferred_apply_target_type === "external_link" ? (
-                          <span className="supporting-copy">Discovery only</span>
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={() => void handleRun(job)}
-                            disabled={runningJobId === job.id || !job.preferred_apply_target_type}
-                          >
-                            {runningJobId === job.id ? "Running..." : "Run now"}
-                          </button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                    </div>
+                    <div className="job-chip-row">
+                      <span className="job-chip">{formatLabel(job.status)}</span>
+                      <span className="job-chip">{formatLabel(job.preferred_apply_target_type)}</span>
+                      <span className="job-chip">
+                        {job.sighting_count} sighting{job.sighting_count === 1 ? "" : "s"}
+                      </span>
+                      <span className="job-chip">
+                        {job.open_question_task_count} question{job.open_question_task_count === 1 ? "" : "s"}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="job-card-relevance">
+                    <span className={`decision-badge decision-${job.relevance_decision}`}>
+                      {formatLabel(job.relevance_decision)}
+                    </span>
+                    <p className="job-card-summary">{job.relevance_summary ?? "No rationale yet."}</p>
+                    {formatFailureCause(job.relevance_failure_cause) ? (
+                      <p className="job-card-subtle">
+                        Temporary issue: {formatFailureCause(job.relevance_failure_cause)}
+                      </p>
+                    ) : null}
+                  </div>
+
+                  <div className="job-card-meta">
+                    <div className="job-stat">
+                      <span className="job-stat-label">Latest run</span>
+                      <strong>{formatLatestRun(job)}</strong>
+                    </div>
+                    <div className="job-stat">
+                      <span className="job-stat-label">Path</span>
+                      <strong>{formatLabel(job.preferred_apply_target_type)}</strong>
+                    </div>
+                  </div>
+
+                  <div className="job-card-actions">
+                    <button
+                      type="button"
+                      className={actionConfig.primaryAction.className}
+                      disabled={updatingJobId === job.id}
+                      onClick={() => void handleRelevanceUpdate(job, actionConfig.primaryAction.decision)}
+                    >
+                      {actionConfig.primaryAction.label}
+                    </button>
+                    {secondaryAction ? (
+                      <button
+                        type="button"
+                        className={secondaryAction.className}
+                        disabled={updatingJobId === job.id}
+                        onClick={() => void handleRelevanceUpdate(job, secondaryAction.decision)}
+                      >
+                        {secondaryAction.label}
+                      </button>
+                    ) : null}
+                    {job.preferred_apply_target_type === "external_link" ? (
+                      <span className="job-inline-note">Discovery only</span>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => void handleRun(job)}
+                        disabled={runningJobId === job.id || !job.preferred_apply_target_type}
+                      >
+                        {runningJobId === job.id ? "Running..." : "Run now"}
+                      </button>
+                    )}
+                  </div>
+                </article>
+              );
+            })}
           </div>
         )}
       </section>

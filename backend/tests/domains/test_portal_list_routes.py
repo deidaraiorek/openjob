@@ -78,7 +78,7 @@ def test_portal_list_routes_return_jobs_answers_and_question_tasks(auth_client, 
     assert tasks_response.json()[0]["prompt_text"] == "Portfolio URL"
 
 
-def test_portal_job_list_hides_filtered_out_jobs(auth_client, db_session) -> None:
+def test_portal_job_list_hides_rejected_jobs_from_active_view(auth_client, db_session) -> None:
     account = ensure_account(db_session, "owner@example.com")
     db_session.add_all(
         [
@@ -109,6 +109,39 @@ def test_portal_job_list_hides_filtered_out_jobs(auth_client, db_session) -> Non
 
     assert jobs_response.status_code == 200
     assert [job["title"] for job in jobs_response.json()] == ["Software Engineer I"]
+
+
+def test_portal_job_list_includes_rejected_jobs_in_reject_view(auth_client, db_session) -> None:
+    account = ensure_account(db_session, "owner@example.com")
+    db_session.add_all(
+        [
+            Job(
+                account_id=account.id,
+                canonical_key="visible-job",
+                company_name="Acme",
+                title="Software Engineer I",
+                location="Remote",
+                status="discovered",
+            ),
+            Job(
+                account_id=account.id,
+                canonical_key="rejected-job",
+                company_name="HardwareCo",
+                title="Hardware Engineer",
+                location="San Jose, CA",
+                status="filtered_out",
+                relevance_decision="reject",
+                relevance_source="title_gate",
+                relevance_summary="title not matched",
+            ),
+        ]
+    )
+    db_session.commit()
+
+    jobs_response = auth_client.get("/api/jobs?relevance=reject")
+
+    assert jobs_response.status_code == 200
+    assert [job["title"] for job in jobs_response.json()] == ["Hardware Engineer"]
 
 
 def test_question_queue_hides_reusable_tasks(auth_client, db_session) -> None:

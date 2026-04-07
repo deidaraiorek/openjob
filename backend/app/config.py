@@ -1,9 +1,8 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 from pathlib import Path
 
 REPO_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
-
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -27,10 +26,13 @@ class Settings(BaseSettings):
     playwright_profile_dir: str = "/tmp/openjob-playwright"
     playwright_artifact_dir: str = "/tmp/openjob-playwright-artifacts"
     groq_api_key: str | None = None
-    groq_model: str = "llama-3.3-70b-versatile"
+    groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
+    groq_title_screening_model: str | None = "meta-llama/llama-4-scout-17b-16e-instruct"
+    groq_job_relevance_model: str | None = "meta-llama/llama-4-scout-17b-16e-instruct"
     groq_base_url: str = "https://api.groq.com/openai/v1"
     relevance_retry_attempts: int = 2
     relevance_retry_base_delay_seconds: float = 0.5
+    sync_full_relevance_batch_size: int = 5
     openai_api_key: str | None = None
     openai_role_profile_model: str = "gpt-5-mini"
     openai_job_relevance_model: str = "gpt-5-mini"

@@ -12,6 +12,7 @@ function buildApi(): AppApi {
     listSources: async () => [],
     createSource: async (payload) => ({ id: 1, ...payload }),
     updateSource: async (sourceId, payload) => ({ id: sourceId, ...payload }),
+    deleteSource: async () => undefined,
     syncSource: async () => ({
       source_id: 1,
       source_key: "test",

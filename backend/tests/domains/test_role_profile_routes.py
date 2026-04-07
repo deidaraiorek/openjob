@@ -48,18 +48,9 @@ def test_role_profile_upsert_updates_existing_profile(auth_client: TestClient) -
     assert response.json()["generated_titles"] == ["Platform Engineer I"]
 
 
-def test_role_profile_upsert_auto_expands_missing_generated_fields(
+def test_role_profile_upsert_keeps_generated_titles_empty_when_not_provided(
     auth_client: TestClient,
-    monkeypatch,
 ) -> None:
-    monkeypatch.setattr(
-        "app.domains.role_profiles.routes.expand_role_profile_prompt",
-        lambda prompt: {
-            "generated_titles": ["Software Engineer I", "Backend Engineer"],
-            "generated_keywords": [],
-        },
-    )
-
     response = auth_client.put(
         "/api/role-profile",
         json={
@@ -70,7 +61,7 @@ def test_role_profile_upsert_auto_expands_missing_generated_fields(
     )
 
     assert response.status_code == 200
-    assert response.json()["generated_titles"] == ["Software Engineer I", "Backend Engineer"]
+    assert response.json()["generated_titles"] == []
     assert response.json()["generated_keywords"] == []
 
 

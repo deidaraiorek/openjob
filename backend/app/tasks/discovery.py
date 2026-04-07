@@ -6,12 +6,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.celery_app import celery_app
+from app.config import get_settings
 from app.domains.accounts.service import ensure_account
 from app.domains.jobs.deduplication import DiscoveryCandidate, ingest_candidate, resolve_existing_job
 from app.domains.jobs.relevance import (
     apply_relevance_result,
     cached_relevance_for_job,
-    evaluate_candidate_relevance,
+    queued_relevance_result,
+    screen_candidate_titles,
+    title_screen_reject_result,
 )
 from app.domains.jobs.models import Job
 from app.domains.role_profiles.models import RoleProfile
@@ -29,8 +32,7 @@ from app.integrations.greenhouse.client import parse_jobs as parse_greenhouse_jo
 from app.integrations.lever.client import fetch_postings as fetch_lever_postings
 from app.integrations.lever.client import parse_postings as parse_lever_postings
 from app.integrations.linkedin.discovery import parse_search_results as parse_linkedin_search_results
-from app.tasks.role_profile_expansion import expand_role_profile_prompt
-
+from app.tasks.job_relevance import evaluate_job_batch_now
 HARD_REJECT_SCORE_THRESHOLD = 0.15
 
 
@@ -52,18 +54,6 @@ def _should_auto_prune(job: Job) -> bool:
         and not job.application_runs
         and not job.question_tasks
     )
-
-
-def _expand_profile_if_needed(session: Session, source: JobSource) -> None:
-    profile = session.scalar(
-        select(RoleProfile).where(RoleProfile.account_id == source.account_id),
-    )
-    if not profile or profile.generated_titles:
-        return
-
-    expanded = expand_role_profile_prompt(profile.prompt)
-    profile.generated_titles = expanded["generated_titles"]
-    profile.generated_keywords = []
 
 
 def _load_role_profile(session: Session, source: JobSource) -> RoleProfile | None:
@@ -112,9 +102,10 @@ def sync_source(session: Session, source_id: int, raw_payload: Any = None) -> di
         return {"processed": 0, "created": 0, "updated": 0}
 
     account = ensure_account(session, session.get(JobSource, source_id).account.email if source.account else "owner@example.com")
-    _expand_profile_if_needed(session, source)
     profile = _load_role_profile(session, source)
     candidates = load_candidates(source, raw_payload=raw_payload)
+    screened_titles = screen_candidate_titles(profile, candidates)
+    queued_job_ids: list[int] = []
 
     processed = 0
     created = 0
@@ -136,14 +127,27 @@ def sync_source(session: Session, source_id: int, raw_payload: Any = None) -> di
                     else None
                 ),
             )
-        result = cached_result or evaluate_candidate_relevance(profile, candidate)
-        if _is_hard_reject(result):
+        screening = screened_titles.get(candidate.title)
+        result = cached_result
+        if result is not None and _is_hard_reject(result):
             if existing_job is not None and _should_auto_prune(existing_job):
                 session.delete(existing_job)
             continue
 
         job, was_created = ingest_candidate(session, account, source, candidate)
         if cached_result is None:
+            if screening is None:
+                raise ValueError(f"Missing title screening result for candidate: {candidate.title}")
+            if screening.decision == "reject":
+                result = title_screen_reject_result(candidate.title, screening)
+            else:
+                result = queued_relevance_result(
+                    candidate.title,
+                    screening,
+                    summary="Title passed screening and is queued for deeper AI relevance review.",
+                    failure_cause="queued_for_async_relevance",
+                )
+                queued_job_ids.append(job.id)
             apply_relevance_result(
                 session,
                 account_id=account.id,
@@ -162,6 +166,8 @@ def sync_source(session: Session, source_id: int, raw_payload: Any = None) -> di
             updated += 1
 
     session.commit()
+    if queued_job_ids:
+        evaluate_job_batch_now(session, account_id=account.id, job_ids=queued_job_ids)
     return {"processed": processed, "created": created, "updated": updated}
 
 

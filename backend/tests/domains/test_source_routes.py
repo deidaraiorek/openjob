@@ -108,6 +108,28 @@ def test_update_source_persists_edited_values(auth_client: TestClient) -> None:
     assert response.json()["settings"] == {"note": "raw markdown"}
 
 
+def test_delete_source_removes_source(auth_client: TestClient) -> None:
+    create_response = auth_client.post(
+        "/api/sources",
+        json={
+            "source_key": "to-delete",
+            "source_type": "github_curated",
+            "name": "Delete Me",
+            "base_url": "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/README.md",
+            "settings": {},
+            "active": True,
+        },
+    )
+    source_id = create_response.json()["id"]
+
+    delete_response = auth_client.delete(f"/api/sources/{source_id}")
+    list_response = auth_client.get("/api/sources")
+
+    assert delete_response.status_code == 204
+    assert list_response.status_code == 200
+    assert list_response.json() == []
+
+
 def test_sync_source_route_returns_validation_error_for_invalid_source_config(
     auth_client: TestClient,
     monkeypatch,
@@ -135,4 +157,38 @@ def test_sync_source_route_returns_validation_error_for_invalid_source_config(
     assert response.status_code == 400
     assert response.json() == {
         "detail": "Greenhouse sources need a valid board URL or settings.board_token."
+    }
+
+
+def test_sync_source_route_rejects_overlapping_sync_requests(
+    auth_client: TestClient,
+    monkeypatch,
+) -> None:
+    create_response = auth_client.post(
+        "/api/sources",
+        json={
+            "source_key": "busy-sync",
+            "source_type": "greenhouse_board",
+            "name": "Busy Sync",
+            "base_url": "https://boards.greenhouse.io/example",
+            "settings": {},
+            "active": True,
+        },
+    )
+    source_id = create_response.json()["id"]
+
+    class LockedSyncGuard:
+        def acquire(self, blocking: bool = True) -> bool:
+            return False
+
+        def release(self) -> None:
+            raise AssertionError("release should not be called when acquire fails")
+
+    monkeypatch.setattr("app.domains.sources.routes._source_sync_lock", LockedSyncGuard())
+
+    response = auth_client.post(f"/api/sources/{source_id}/sync")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "A source sync is already running. Wait for it to finish before starting another one."
     }

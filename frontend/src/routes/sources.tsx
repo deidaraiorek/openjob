@@ -58,6 +58,17 @@ function normalizeGithubCuratedUrl(sourceType: string, baseUrl: string | null): 
   }
 }
 
+function formatSourceType(sourceType: string): string {
+  return sourceType
+    .split("_")
+    .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1))
+    .join(" ");
+}
+
+function displaySourceName(source: Source): string {
+  return source.name.trim() || source.source_key;
+}
+
 export function SourcesRoute() {
   const { api } = useAppContext();
   const [sources, setSources] = useState<Source[]>([]);
@@ -68,6 +79,8 @@ export function SourcesRoute() {
   const [error, setError] = useState<string | null>(null);
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [syncingSourceId, setSyncingSourceId] = useState<number | null>(null);
+  const [pendingDeleteSource, setPendingDeleteSource] = useState<Source | null>(null);
+  const [deletingSourceId, setDeletingSourceId] = useState<number | null>(null);
 
   async function reloadSources() {
     setSources(await api.listSources());
@@ -155,6 +168,40 @@ export function SourcesRoute() {
     }
   }
 
+  async function handleDelete(source: Source) {
+    setPendingDeleteSource(source);
+    setError(null);
+    setSyncMessage(null);
+  }
+
+  async function confirmDelete() {
+    if (!pendingDeleteSource) {
+      return;
+    }
+
+    setError(null);
+    setSyncMessage(null);
+    setDeletingSourceId(pendingDeleteSource.id);
+
+    try {
+      await api.deleteSource(pendingDeleteSource.id);
+      if (editingSourceId === pendingDeleteSource.id) {
+        handleCancelEdit();
+      }
+      await reloadSources();
+      setSyncMessage(`${pendingDeleteSource.name} deleted.`);
+      setPendingDeleteSource(null);
+    } catch (caughtError) {
+      if (caughtError instanceof Error) {
+        setError(caughtError.message);
+      } else {
+        setError(`Unable to delete ${pendingDeleteSource.name} right now.`);
+      }
+    } finally {
+      setDeletingSourceId(null);
+    }
+  }
+
   return (
     <main className="page-shell">
       <section className="content-grid">
@@ -174,33 +221,70 @@ export function SourcesRoute() {
           ) : (
             <ul className="stack-list">
               {sources.map((source) => (
-                <li key={source.id} className="stack-row stack-row-column">
-                  <div>
-                    <strong>{source.name}</strong>
-                    <span>{source.source_type}</span>
-                    <span>{source.base_url ?? "No base URL"}</span>
+                <li
+                  key={source.id}
+                  className={`stack-row stack-row-column source-card${
+                    syncingSourceId === source.id ? " source-card-syncing" : ""
+                  }`}
+                >
+                  <div className="source-card-head">
+                    <div className="source-card-topline">
+                      <strong>{displaySourceName(source)}</strong>
+                      <span className="source-type-pill">{formatSourceType(source.source_type)}</span>
+                    </div>
+                    {source.name.trim() && source.name.trim() !== source.source_key ? (
+                      <p className="source-key-line">{source.source_key}</p>
+                    ) : null}
                   </div>
-                  <div className="button-row">
+                  <div className="source-link-block">
+                    <span className="source-link-label">Monitored URL</span>
+                    <p className="source-link-value">{source.base_url ?? "No base URL yet."}</p>
+                  </div>
+                  {syncingSourceId === source.id ? (
+                    <div className="source-sync-status" role="status" aria-live="polite">
+                      <span className="source-sync-pulse" aria-hidden="true" />
+                      Checking this source for new jobs and updating relevance.
+                    </div>
+                  ) : null}
+                  <div className="button-row source-card-actions">
                     <button
                       type="button"
                       className="secondary-button"
                       onClick={() => handleEdit(source)}
+                      disabled={syncingSourceId === source.id}
                     >
                       Edit
                     </button>
                     <button
                       type="button"
+                      className="ghost-button"
+                      onClick={() => void handleDelete(source)}
+                      disabled={syncingSourceId === source.id}
+                    >
+                      Delete
+                    </button>
+                    <button
+                      type="button"
+                      className={`source-primary-button${
+                        syncingSourceId === source.id ? " source-sync-button" : ""
+                      }`}
                       onClick={() => void handleSync(source)}
                       disabled={syncingSourceId === source.id}
                     >
-                      {syncingSourceId === source.id ? "Syncing..." : "Sync now"}
+                      {syncingSourceId === source.id ? (
+                        <>
+                          <span className="button-spinner" aria-hidden="true" />
+                          Syncing source
+                        </>
+                      ) : (
+                        "Sync now"
+                      )}
                     </button>
                   </div>
                 </li>
               ))}
             </ul>
           )}
-          {syncMessage ? <p className="supporting-copy">{syncMessage}</p> : null}
         </article>
 
         <article className="panel-card">
@@ -280,6 +364,43 @@ export function SourcesRoute() {
           </form>
         </article>
       </section>
+      {pendingDeleteSource ? (
+        <div className="confirm-toast" role="status" aria-live="polite">
+          <div className="confirm-toast-copy">
+            <strong>Delete source?</strong>
+            <p>
+              Remove <span>{pendingDeleteSource.name}</span> from discovery inputs. You can add it back later, but
+              this source will stop syncing immediately.
+            </p>
+          </div>
+          <div className="button-row">
+            <button
+              type="button"
+              className="ghost-button"
+              onClick={() => setPendingDeleteSource(null)}
+              disabled={deletingSourceId === pendingDeleteSource.id}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="danger-button"
+              onClick={() => void confirmDelete()}
+              disabled={deletingSourceId === pendingDeleteSource.id}
+            >
+              {deletingSourceId === pendingDeleteSource.id ? "Deleting..." : "Delete source"}
+            </button>
+          </div>
+        </div>
+      ) : null}
+      {syncMessage ? (
+        <div className="action-toast" role="status" aria-live="polite">
+          <p>{syncMessage}</p>
+          <button type="button" className="ghost-button action-toast-close" onClick={() => setSyncMessage(null)}>
+            Dismiss
+          </button>
+        </div>
+      ) : null}
     </main>
   );
 }

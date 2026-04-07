@@ -139,6 +139,12 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
       Object.assign(source, payload);
       return source;
     },
+    deleteSource: async (sourceId) => {
+      const index = sources.findIndex((item) => item.id === sourceId);
+      if (index >= 0) {
+        sources.splice(index, 1);
+      }
+    },
     syncSource: async (sourceId) => {
       const source = sources.find((item) => item.id === sourceId)!;
       const summary: SourceSyncResult = {
@@ -227,7 +233,7 @@ test("renders the jobs route inside the portal layout", async () => {
 
   expect(await screen.findByRole("heading", { name: /tracked opportunities/i })).toBeInTheDocument();
   expect(await screen.findByRole("link", { name: /acme/i })).toBeInTheDocument();
-  expect(await screen.findByText(/greenhouse_apply/i)).toBeInTheDocument();
+  expect(await screen.findAllByText(/greenhouse apply/i)).not.toHaveLength(0);
   expect(await screen.findByRole("button", { name: /run now/i })).toBeInTheDocument();
 });
 
@@ -353,13 +359,32 @@ test("syncs a source from the sources screen", async () => {
   });
 });
 
+test("deletes a source from the sources screen", async () => {
+  const user = userEvent.setup();
+  const router = createMemoryAppRouter(createMockApi(), ["/sources"]);
+
+  render(<RouterProvider router={router} />);
+
+  await screen.findByRole("heading", { name: /discovery inputs/i });
+  await user.click(await screen.findByRole("button", { name: /delete/i }));
+  expect(screen.getByText(/delete source\?/i)).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /delete source/i }));
+
+  await waitFor(() => {
+    expect(screen.getByText(/no sources configured yet\./i)).toBeInTheDocument();
+  });
+  expect(screen.getByText(/greenhouse deleted\./i)).toBeInTheDocument();
+});
+
 test("saves the role profile from the role-profile screen", async () => {
   const user = userEvent.setup();
   let savedPrompt = "";
+  let savedTitles: string[] = ["unexpected"];
   const router = createMemoryAppRouter(
     createMockApi({
       saveRoleProfile: async (payload) => {
         savedPrompt = payload.prompt;
+        savedTitles = payload.generated_titles;
         return { id: 1, ...payload };
       },
     }),
@@ -378,38 +403,19 @@ test("saves the role profile from the role-profile screen", async () => {
     expect(screen.getByText(/saved/i)).toBeInTheDocument();
   });
   expect(savedPrompt).toBe("early career platform engineer");
+  expect(savedTitles).toEqual([]);
 });
 
-test("generates role profile suggestions from the prompt", async () => {
-  const user = userEvent.setup();
-  const router = createMemoryAppRouter(
-    createMockApi({
-      saveRoleProfile: async (payload) => ({
-        id: 1,
-        prompt: payload.prompt,
-        generated_titles: payload.generated_titles.length
-          ? payload.generated_titles
-          : ["Software Engineer I", "Backend Engineer"],
-        generated_keywords: payload.generated_keywords.length
-          ? payload.generated_keywords
-          : ["new grad", "backend"],
-      }),
-    }),
-    ["/role-profile"],
-  );
+test("role profile screen no longer shows generated title controls", async () => {
+  const router = createMemoryAppRouter(createMockApi(), ["/role-profile"]);
 
   render(<RouterProvider router={router} />);
 
-  const promptField = await screen.findByLabelText(/prompt/i);
-  fireEvent.change(promptField, {
-    target: { value: "new grad backend software engineer" },
-  });
-  await user.click(screen.getByRole("button", { name: /generate with ai/i }));
+  await screen.findByRole("heading", { name: /targeting memory/i });
 
-  await waitFor(() => {
-    expect(screen.getByDisplayValue(/software engineer i, backend engineer/i)).toBeInTheDocument();
-  });
-  expect(screen.getByText(/generated suggestions/i)).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /generate with ai/i })).not.toBeInTheDocument();
+  expect(screen.queryByLabelText(/generated titles/i)).not.toBeInTheDocument();
+  expect(screen.getByText(/screened in ai batches against this prompt first/i)).toBeInTheDocument();
 });
 
 test("shows action-needed runs in the operator queue", async () => {
@@ -483,6 +489,38 @@ test("updates job relevance from the jobs screen", async () => {
   await waitFor(() => {
     expect(screen.getByText(/relevance updated to reject/i)).toBeInTheDocument();
   });
+});
+
+test("shows a single recovery action for rejected jobs", async () => {
+  const router = createMemoryAppRouter(
+    createMockApi({
+      listJobs: async () => [
+        {
+          id: 1,
+          canonical_key: "ops-associate",
+          company_name: "Acme",
+          title: "Operations Associate",
+          location: "Remote",
+          status: "discovered",
+          relevance_decision: "reject",
+          relevance_source: "ai",
+          relevance_score: 0.18,
+          relevance_summary: "This role sits outside the software engineering profile.",
+          relevance_failure_cause: null,
+          preferred_apply_target_type: "greenhouse_apply",
+          sighting_count: 1,
+          open_question_task_count: 0,
+          latest_application_run_status: null,
+        },
+      ],
+    }),
+    ["/jobs"],
+  );
+
+  render(<RouterProvider router={router} />);
+
+  expect(await screen.findByRole("button", { name: /^include$/i })).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /^exclude$/i })).not.toBeInTheDocument();
 });
 
 test("renders multi-select question choices and saves structured answers", async () => {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from threading import Lock
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -14,6 +15,7 @@ from app.db.session import get_db_session
 from app.tasks.discovery import sync_source
 
 router = APIRouter(prefix="/sources", tags=["sources"])
+_source_sync_lock = Lock()
 
 
 class SourceCreateRequest(BaseModel):
@@ -152,6 +154,25 @@ def update_source(
     return serialize_source(source)
 
 
+@router.delete("/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_source(
+    source_id: int,
+    current_account: Account = Depends(get_current_account),
+    session: Session = Depends(get_db_session),
+) -> None:
+    source = session.scalar(
+        select(JobSource).where(
+            JobSource.id == source_id,
+            JobSource.account_id == current_account.id,
+        ),
+    )
+    if not source:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source not found")
+
+    session.delete(source)
+    session.commit()
+
+
 @router.post("/{source_id}/sync", response_model=SourceSyncResponse)
 def trigger_source_sync(
     source_id: int,
@@ -167,10 +188,18 @@ def trigger_source_sync(
     if not source:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source not found")
 
+    if not _source_sync_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A source sync is already running. Wait for it to finish before starting another one.",
+        )
+
     try:
         summary = sync_source(session, source.id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    finally:
+        _source_sync_lock.release()
 
     return SourceSyncResponse(
         source_id=source.id,

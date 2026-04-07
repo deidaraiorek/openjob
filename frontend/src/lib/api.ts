@@ -91,6 +91,7 @@ export type JobListItem = {
   relevance_score: number | null;
   relevance_summary: string | null;
   relevance_failure_cause: string | null;
+  relevance_decision_phase: string | null;
   preferred_apply_target_type: string | null;
   sighting_count: number;
   open_question_task_count: number;
@@ -109,6 +110,7 @@ export type JobDetail = {
   relevance_score: number | null;
   relevance_summary: string | null;
   relevance_failure_cause: string | null;
+  relevance_decision_phase: string | null;
   sightings: {
     id: number;
     source_id: number | null;
@@ -144,6 +146,7 @@ export type JobDetail = {
     concerns: string[];
     model_name: string | null;
     failure_cause: string | null;
+    decision_phase: string | null;
   }[];
 };
 
@@ -159,6 +162,7 @@ export type JobRelevanceUpdateResult = {
   relevance_score: number | null;
   relevance_summary: string | null;
   relevance_failure_cause: string | null;
+  relevance_decision_phase: string | null;
 };
 
 export type ActionNeededItem = {
@@ -196,6 +200,7 @@ export interface AppApi extends AuthApi {
   listSources(): Promise<Source[]>;
   createSource(payload: SourceCreatePayload): Promise<Source>;
   updateSource(sourceId: number, payload: SourceUpdatePayload): Promise<Source>;
+  deleteSource(sourceId: number): Promise<void>;
   syncSource(sourceId: number): Promise<SourceSyncResult>;
   getRoleProfile(): Promise<RoleProfile>;
   saveRoleProfile(payload: RoleProfilePayload): Promise<RoleProfile>;
@@ -281,6 +286,11 @@ export const apiClient: AppApi = {
     return request<Source>(`/api/sources/${sourceId}`, {
       method: "PUT",
       body: JSON.stringify(payload),
+    });
+  },
+  deleteSource(sourceId) {
+    return request<void>(`/api/sources/${sourceId}`, {
+      method: "DELETE",
     });
   },
   syncSource(sourceId) {
