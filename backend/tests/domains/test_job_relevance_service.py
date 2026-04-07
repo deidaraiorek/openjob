@@ -73,6 +73,8 @@ def test_evaluate_candidate_relevance_uses_structured_ai_result(monkeypatch, db_
     assert result.score == 0.96
     assert result.summary == "Strong early-career backend match."
     assert captured["matched_titles"] == ["Software Engineer I"]
+    assert captured["decision_policy"]["title_screening_mode"] == "pass_or_reject"
+    assert captured["derived_profile_hints"]["target_level_band"] == "early_career"
 
 def test_evaluate_candidate_relevance_rejects_before_ai_when_title_screening_rejects(monkeypatch, db_session) -> None:
     account = ensure_account(db_session, "owner@example.com")
@@ -189,8 +191,9 @@ def test_evaluate_candidate_relevance_allows_safe_modifiers_through_title_gate(m
     )
 
     assert result.decision == "review"
-    assert captured["matched_titles"] == ["Software Engineer - New Grad - AI Platform"]
+    assert captured["matched_titles"] == ["Software Engineer I", "New Grad Software Engineer"]
     assert captured["title_screening_decision"] == "pass"
+    assert captured["decision_policy"]["prefer_match_over_review_when_context_is_consistent"] is True
 
 
 def test_evaluate_candidate_relevance_rejects_more_senior_titles_before_ai(monkeypatch, db_session) -> None:
@@ -281,7 +284,7 @@ def test_evaluate_candidate_relevance_allows_ambiguous_seniority_through_to_ai(m
                 (),
                 {
                     "title": candidate.title,
-                    "decision": "review",
+                    "decision": "pass",
                     "summary": "Title family looks right, but seniority is ambiguous.",
                     "source": "ai",
                     "model_name": "groq-test",
@@ -307,8 +310,8 @@ def test_evaluate_candidate_relevance_allows_ambiguous_seniority_through_to_ai(m
     )
 
     assert result.decision == "review"
-    assert captured["matched_titles"] == ["Software Engineer"]
-    assert captured["title_screening_decision"] == "review"
+    assert captured["matched_titles"] == ["Software Engineer I"]
+    assert captured["title_screening_decision"] == "pass"
 
 
 def test_apply_relevance_result_updates_job_and_writes_history(db_session) -> None:
@@ -354,6 +357,9 @@ def test_apply_relevance_result_updates_job_and_writes_history(db_session) -> No
     assert job.relevance_decision == "review"
     assert job.relevance_summary == "Looks close, but title is broad enough to review."
     assert evaluation.profile_snapshot_hash is not None
+    assert evaluation.payload["decision_phase"] == "full_relevance"
+    assert evaluation.payload["decision_policy_snapshot"]["title_screening_mode"] == "pass_or_reject"
+    assert evaluation.payload["derived_profile_hints"]["target_level_band"] == "early_career"
 
 
 def test_cached_relevance_skips_provider_failure_evaluations(db_session) -> None:
@@ -405,3 +411,131 @@ def test_cached_relevance_skips_provider_failure_evaluations(db_session) -> None
     )
 
     assert cached is None
+
+
+def test_hardware_engineer_rejected_at_phase1_never_reaches_phase2(monkeypatch, db_session) -> None:
+    account = ensure_account(db_session, "owner@example.com")
+    profile = RoleProfile(
+        account_id=account.id,
+        prompt="SWE new grad",
+        generated_titles=["Software Engineer I", "Junior Software Engineer"],
+        generated_keywords=[],
+    )
+
+    phase2_called = {"value": False}
+
+    def fake_classify_relevance(profile, **kwargs):
+        phase2_called["value"] = True
+        return JobRelevanceResult(
+            decision="match",
+            score=0.9,
+            summary="Should not be called.",
+            matched_signals=[],
+            concerns=[],
+            source="ai",
+            model_name="groq-test",
+            failure_cause=None,
+            payload={},
+        )
+
+    monkeypatch.setattr("app.domains.jobs.relevance.classify_job_relevance", fake_classify_relevance)
+    monkeypatch.setattr(
+        "app.domains.jobs.relevance.screen_candidate_titles",
+        lambda profile, candidates: {
+            candidate.title: type(
+                "TitleGateResult",
+                (),
+                {
+                    "title": candidate.title,
+                    "decision": "reject",
+                    "summary": "Hardware engineering is a different discipline.",
+                    "source": "ai",
+                    "model_name": "groq-test",
+                    "failure_cause": None,
+                    "payload": {"decision_rationale_type": "clear_family_mismatch"},
+                },
+            )()
+            for candidate in candidates
+        },
+    )
+
+    result = evaluate_candidate_relevance(
+        profile,
+        DiscoveryCandidate(
+            source_type="greenhouse_board",
+            company_name="Acme",
+            title="Hardware Engineer",
+            listing_url="https://boards.greenhouse.io/acme/jobs/hw",
+            location="Remote",
+            apply_url="https://boards.greenhouse.io/acme/jobs/hw",
+            apply_target_type="greenhouse_apply",
+        ),
+    )
+
+    assert phase2_called["value"] is False
+    assert result.decision == "reject"
+    assert result.source == "title_screening"
+
+
+def test_backend_engineer_new_grad_passes_phase1_and_reaches_phase2(monkeypatch, db_session) -> None:
+    account = ensure_account(db_session, "owner@example.com")
+    profile = RoleProfile(
+        account_id=account.id,
+        prompt="SWE new grad",
+        generated_titles=["Software Engineer I", "Junior Software Engineer", "New Grad Software Engineer"],
+        generated_keywords=[],
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_classify_relevance(profile, **kwargs):
+        captured.update(kwargs)
+        return JobRelevanceResult(
+            decision="match",
+            score=0.95,
+            summary="Early-career backend role in the software engineering family.",
+            matched_signals=["backend engineer", "new grad"],
+            concerns=[],
+            source="ai",
+            model_name="groq-test",
+            failure_cause=None,
+            payload={},
+        )
+
+    monkeypatch.setattr("app.domains.jobs.relevance.classify_job_relevance", fake_classify_relevance)
+    monkeypatch.setattr(
+        "app.domains.jobs.relevance.screen_candidate_titles",
+        lambda profile, candidates: {
+            candidate.title: type(
+                "TitleGateResult",
+                (),
+                {
+                    "title": candidate.title,
+                    "decision": "pass",
+                    "summary": "Backend engineering is in the software engineering family.",
+                    "source": "ai",
+                    "model_name": "groq-test",
+                    "failure_cause": None,
+                    "payload": {},
+                },
+            )()
+            for candidate in candidates
+        },
+    )
+
+    result = evaluate_candidate_relevance(
+        profile,
+        DiscoveryCandidate(
+            source_type="greenhouse_board",
+            company_name="Acme",
+            title="Backend Engineer – New Grad",
+            listing_url="https://boards.greenhouse.io/acme/jobs/be",
+            location="Remote",
+            apply_url="https://boards.greenhouse.io/acme/jobs/be",
+            apply_target_type="greenhouse_apply",
+        ),
+    )
+
+    assert captured, "Phase 2 should have been called"
+    assert result.decision == "match"
+    assert captured["matched_titles"] == ["Software Engineer I", "Junior Software Engineer", "New Grad Software Engineer"]

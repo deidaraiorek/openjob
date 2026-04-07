@@ -63,7 +63,9 @@ def test_linkedin_discovery_collapses_into_existing_ats_backed_job(db_session) -
     job_count = db_session.scalar(select(func.count(Job.id)))
     targets = db_session.scalars(select(ApplyTarget).order_by(ApplyTarget.id)).all()
 
-    assert summary == {"processed": 1, "created": 0, "updated": 1}
+    assert summary["processed"] == 1
+    assert summary["created"] == 0
+    assert summary["updated"] == 1
     assert job_count == 1
     assert len(targets) == 2
     preferred_target = next(target for target in targets if target.is_preferred)

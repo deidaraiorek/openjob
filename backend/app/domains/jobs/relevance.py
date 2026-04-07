@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.domains.jobs.deduplication import DiscoveryCandidate
-from app.domains.jobs.models import Job, JobRelevanceEvaluation
+from app.domains.jobs.models import Job, JobRelevanceEvaluation, JobRelevanceTask
+from app.domains.jobs.relevance_policy import build_decision_policy, derive_profile_hints
 from app.domains.role_profiles.models import RoleProfile
 from app.integrations.openai.job_relevance import (
     JobRelevanceBatchRequest,
@@ -14,6 +17,10 @@ from app.integrations.openai.job_relevance import (
     classify_job_relevance,
 )
 from app.integrations.openai.job_title_screening import classify_job_titles
+
+PENDING_TITLE_SCREENING_SOURCE = "pending_title_screening"
+PENDING_FULL_RELEVANCE_SOURCE = "pending_full_relevance"
+TRANSIENT_FAILURE_CAUSES = {"provider_rate_limited", "provider_timeout", "provider_unavailable"}
 
 
 def profile_snapshot_hash(profile: RoleProfile | None) -> str | None:
@@ -109,16 +116,19 @@ def evaluate_candidate_relevance(
     profile: RoleProfile | None,
     candidate: DiscoveryCandidate,
     *,
-    screening: ScreenedTitle | None = None,
+    screening: TitleGateResult | None = None,
 ) -> JobRelevanceResult:
     resolved_screening = screening
     if resolved_screening is None:
         title_screen = screen_candidate_titles(profile, [candidate])
         resolved_screening = title_screen[candidate.title]
-    if resolved_screening.decision == "reject":
+    if is_transient_failure_cause(resolved_screening.failure_cause):
+        return title_screen_pending_result(candidate.title, resolved_screening)
+    if resolved_screening.decision == "reject" and resolved_screening.source == "ai":
         return title_screen_reject_result(candidate.title, resolved_screening)
 
     description_snippet = _extract_description_snippet(candidate, None)
+    generated_titles = (profile.generated_titles if profile and profile.generated_titles else None) or [candidate.title]
     return classify_job_relevance(
         profile,
         title=candidate.title,
@@ -127,10 +137,12 @@ def evaluate_candidate_relevance(
         source_type=candidate.source_type,
         apply_target_type=candidate.apply_target_type,
         description_snippet=description_snippet,
-        matched_titles=[candidate.title],
+        matched_titles=generated_titles,
         title_screening_decision=resolved_screening.decision,
         title_screening_summary=resolved_screening.summary,
         title_screening_source=resolved_screening.source,
+        decision_policy=build_decision_policy(profile),
+        derived_profile_hints=derive_profile_hints(profile),
     )
 
 
@@ -169,9 +181,12 @@ def evaluate_job_relevance(
     screening = title_screen.get(job.title)
     if screening is None and candidate is None:
         screening = screen_candidate_title(profile, job.title)
-    if screening and screening.decision == "reject":
+    if screening and is_transient_failure_cause(screening.failure_cause):
+        return title_screen_pending_result(job.title, screening)
+    if screening and screening.decision == "reject" and screening.source == "ai":
         return title_screen_reject_result(job.title, screening)
 
+    generated_titles = (profile.generated_titles if profile and profile.generated_titles else None) or [job.title]
     return classify_job_relevance(
         profile,
         title=job.title,
@@ -180,15 +195,24 @@ def evaluate_job_relevance(
         source_type=candidate.source_type if candidate else None,
         apply_target_type=preferred_target.target_type if preferred_target else None,
         description_snippet=description_snippet,
-        matched_titles=[job.title],
+        matched_titles=generated_titles,
         title_screening_decision=screening.decision if screening else None,
         title_screening_summary=screening.summary if screening else None,
         title_screening_source=screening.source if screening else None,
+        decision_policy=build_decision_policy(profile),
+        derived_profile_hints=derive_profile_hints(profile),
     )
 
 
-class ScreenedTitle:
-    __slots__ = ("title", "decision", "summary", "source", "model_name", "failure_cause", "payload")
+class TitleGateResult:
+    """Result from the Phase 1 title gate.
+
+    Future gates (country, focus area, etc.) should return an equivalent shape
+    and plug into evaluate_candidate_relevance / evaluate_job_relevance as
+    additional early-exits before Phase 2.
+    """
+
+    __slots__ = ("gate_name", "title", "decision", "summary", "source", "model_name", "failure_cause", "payload")
 
     def __init__(
         self,
@@ -200,7 +224,9 @@ class ScreenedTitle:
         model_name: str | None,
         failure_cause: str | None,
         payload: dict[str, object],
+        gate_name: str = "title",
     ) -> None:
+        self.gate_name = gate_name
         self.title = title
         self.decision = decision
         self.summary = summary
@@ -210,41 +236,54 @@ class ScreenedTitle:
         self.payload = payload
 
 
-def screen_candidate_title(profile: RoleProfile | None, title: str) -> ScreenedTitle:
-    result = classify_job_titles(profile.prompt if profile else None, [title])
+ScreenedTitle = TitleGateResult
+
+
+def screen_candidate_title(profile: RoleProfile | None, title: str) -> TitleGateResult:
+    result = classify_job_titles(
+        profile.prompt if profile else None,
+        [title],
+        decision_policy=build_decision_policy(profile),
+        derived_profile_hints=derive_profile_hints(profile),
+    )
     item = result.items[0]
-    return ScreenedTitle(
+    return TitleGateResult(
         title=item.title,
         decision=item.decision,
         summary=item.summary,
-        source=result.source,
-        model_name=result.model_name,
-        failure_cause=result.failure_cause,
-        payload=result.payload,
+        source=item.source,
+        model_name=item.model_name,
+        failure_cause=item.failure_cause,
+        payload={**result.payload, **item.payload, "decision_rationale_type": item.decision_rationale_type},
     )
 
 
 def screen_candidate_titles(
     profile: RoleProfile | None,
     candidates: list[DiscoveryCandidate],
-) -> dict[str, ScreenedTitle]:
+) -> dict[str, TitleGateResult]:
     titles = [candidate.title for candidate in candidates]
-    result = classify_job_titles(profile.prompt if profile else None, titles)
+    result = classify_job_titles(
+        profile.prompt if profile else None,
+        titles,
+        decision_policy=build_decision_policy(profile),
+        derived_profile_hints=derive_profile_hints(profile),
+    )
     return {
-        item.title: ScreenedTitle(
+        item.title: TitleGateResult(
             title=item.title,
             decision=item.decision,
             summary=item.summary,
-            source=result.source,
-            model_name=result.model_name,
-            failure_cause=result.failure_cause,
-            payload=result.payload,
+            source=item.source,
+            model_name=item.model_name,
+            failure_cause=item.failure_cause,
+            payload={**result.payload, **item.payload, "decision_rationale_type": item.decision_rationale_type},
         )
         for item in result.items
     }
 
 
-def title_screen_reject_result(title: str, screening: ScreenedTitle) -> JobRelevanceResult:
+def title_screen_reject_result(title: str, screening: TitleGateResult) -> JobRelevanceResult:
     return JobRelevanceResult(
         decision="reject",
         score=0.0,
@@ -258,12 +297,33 @@ def title_screen_reject_result(title: str, screening: ScreenedTitle) -> JobRelev
             "screening_decision": screening.decision,
             "screening_summary": screening.summary,
             "screening_source": screening.source,
+            "decision_rationale_type": screening.payload.get("decision_rationale_type"),
             "screening_payload": screening.payload,
         },
     )
 
 
-def title_screen_review_result(title: str, screening: ScreenedTitle) -> JobRelevanceResult:
+def title_screen_pending_result(title: str, screening: TitleGateResult) -> JobRelevanceResult:
+    return JobRelevanceResult(
+        decision="pending",
+        score=None,
+        summary=screening.summary or pending_summary_for_phase("title_screening"),
+        matched_signals=[title],
+        concerns=["title_screening_pending"],
+        source=PENDING_TITLE_SCREENING_SOURCE,
+        model_name=screening.model_name,
+        failure_cause=screening.failure_cause,
+        payload={
+            "screening_decision": screening.decision,
+            "screening_summary": screening.summary,
+            "screening_source": screening.source,
+            "decision_rationale_type": screening.payload.get("decision_rationale_type"),
+            "screening_payload": screening.payload,
+        },
+    )
+
+
+def title_screen_review_result(title: str, screening: TitleGateResult) -> JobRelevanceResult:
     return JobRelevanceResult(
         decision="review",
         score=None,
@@ -277,37 +337,99 @@ def title_screen_review_result(title: str, screening: ScreenedTitle) -> JobRelev
             "screening_decision": screening.decision,
             "screening_summary": screening.summary,
             "screening_source": screening.source,
+            "decision_rationale_type": screening.payload.get("decision_rationale_type"),
             "screening_payload": screening.payload,
         },
     )
 
 
-def queued_relevance_result(
-    title: str,
-    screening: ScreenedTitle,
+def pending_summary_for_phase(phase: str) -> str:
+    if phase == "title_screening":
+        return "Waiting for AI title screening."
+    return "Waiting for full AI relevance review."
+
+
+def pending_source_for_phase(phase: str) -> str:
+    if phase == "title_screening":
+        return PENDING_TITLE_SCREENING_SOURCE
+    return PENDING_FULL_RELEVANCE_SOURCE
+
+
+def mark_job_pending(
+    job: Job,
     *,
-    summary: str,
-    failure_cause: str,
-) -> JobRelevanceResult:
-    return JobRelevanceResult(
-        decision="review",
-        score=None,
-        summary=summary,
-        matched_signals=[title],
-        concerns=["queued_relevance"],
-        source="relevance_queue",
-        model_name=screening.model_name,
-        failure_cause=failure_cause,
-        payload={
-            "screening_decision": screening.decision,
-            "screening_summary": screening.summary,
-            "screening_source": screening.source,
-            "screening_payload": screening.payload,
-        },
+    phase: str,
+    summary: str | None = None,
+) -> None:
+    job.relevance_decision = "pending"
+    job.relevance_source = pending_source_for_phase(phase)
+    job.relevance_score = None
+    job.relevance_summary = summary or pending_summary_for_phase(phase)
+
+
+def screening_payload_for_task(screening: TitleGateResult) -> dict[str, object]:
+    return {
+        "screening_decision": screening.decision,
+        "screening_summary": screening.summary,
+        "screening_source": screening.source,
+        "decision_rationale_type": screening.payload.get("decision_rationale_type"),
+        "screening_payload": screening.payload,
+    }
+
+
+def upsert_relevance_task(
+    session: Session,
+    *,
+    account_id: int,
+    job_id: int,
+    phase: str,
+    available_at: datetime | None = None,
+    last_failure_cause: str | None = None,
+    payload: dict[str, object] | None = None,
+    reset_attempts: bool = False,
+) -> JobRelevanceTask:
+    task = session.scalar(
+        select(JobRelevanceTask).where(
+            JobRelevanceTask.account_id == account_id,
+            JobRelevanceTask.job_id == job_id,
+            JobRelevanceTask.phase == phase,
+        )
     )
+    if task is None:
+        task = JobRelevanceTask(
+            account_id=account_id,
+            job_id=job_id,
+            phase=phase,
+        )
+        session.add(task)
+    task.available_at = available_at or datetime.now(UTC)
+    task.lease_expires_at = None
+    task.last_failure_cause = last_failure_cause
+    if payload is not None:
+        task.payload = payload
+    if reset_attempts:
+        task.attempt_count = 0
+    session.flush()
+    return task
 
 
-def build_batch_request_for_job(job: Job) -> JobRelevanceBatchRequest:
+def delete_relevance_task(session: Session, task: JobRelevanceTask | None) -> None:
+    if task is None:
+        return
+    session.delete(task)
+    session.flush()
+
+
+def is_transient_failure_cause(failure_cause: str | None) -> bool:
+    return failure_cause in TRANSIENT_FAILURE_CAUSES
+
+
+def build_batch_request_for_job(
+    job: Job,
+    *,
+    profile: RoleProfile | None = None,
+    screening_payload: dict[str, object] | None = None,
+) -> JobRelevanceBatchRequest:
     preferred_target = next((target for target in job.apply_targets if target.is_preferred), None)
     latest_sighting = max(job.sightings, key=lambda item: item.id, default=None)
     candidate = None
@@ -325,7 +447,9 @@ def build_batch_request_for_job(job: Job) -> JobRelevanceBatchRequest:
         )
 
     latest_evaluation = job.relevance_evaluations[0] if job.relevance_evaluations else None
-    payload = latest_evaluation.payload if latest_evaluation is not None else {}
+    payload = screening_payload or (latest_evaluation.payload if latest_evaluation is not None else {})
+
+    generated_titles = (profile.generated_titles if profile and profile.generated_titles else None) or [job.title]
 
     return JobRelevanceBatchRequest(
         title=job.title,
@@ -334,7 +458,7 @@ def build_batch_request_for_job(job: Job) -> JobRelevanceBatchRequest:
         source_type=candidate.source_type if candidate else None,
         apply_target_type=preferred_target.target_type if preferred_target else None,
         description_snippet=_extract_description_snippet(candidate, job),
-        matched_titles=[job.title],
+        matched_titles=generated_titles,
         title_screening_decision=payload.get("screening_decision"),
         title_screening_summary=payload.get("screening_summary"),
         title_screening_source=payload.get("screening_source"),
@@ -381,6 +505,8 @@ def apply_relevance_result(
     evaluation_payload = dict(result.payload)
     evaluation_payload["job_fingerprint"] = fingerprint
     evaluation_payload["failure_cause"] = result.failure_cause
+    evaluation_payload["decision_policy_snapshot"] = build_decision_policy(profile)
+    evaluation_payload["derived_profile_hints"] = derive_profile_hints(profile)
     evaluation_payload["decision_phase"] = (
         "title_screening"
         if result.source == "title_screening"
