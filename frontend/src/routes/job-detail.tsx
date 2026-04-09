@@ -20,6 +20,19 @@ function formatFailureCause(value: string | null): string | null {
   return labels[value] ?? value.replaceAll("_", " ");
 }
 
+function formatPendingPhase(value: string | null | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+  if (value === "title_screening") {
+    return "Waiting for AI title screening";
+  }
+  if (value === "full_relevance") {
+    return "Waiting for full AI relevance review";
+  }
+  return value.replaceAll("_", " ");
+}
+
 export function JobDetailRoute() {
   const { api } = useAppContext();
   const { jobId } = useParams();
@@ -106,7 +119,13 @@ export function JobDetailRoute() {
               Relevance: {job.relevance_decision}
               {job.relevance_score !== null ? ` (${Math.round(job.relevance_score * 100)}%)` : ""}
             </p>
-            {formatFailureCause(job.relevance_failure_cause) ? (
+            {job.relevance_decision === "pending" && formatPendingPhase(job.pending_relevance_phase) ? (
+              <p className="muted-copy">
+                {formatPendingPhase(job.pending_relevance_phase)}
+                {job.pending_relevance_attempt_count ? ` · attempt ${job.pending_relevance_attempt_count + 1}` : ""}
+              </p>
+            ) : null}
+            {job.relevance_decision !== "pending" && formatFailureCause(job.relevance_failure_cause) ? (
               <p className="muted-copy">Temporary issue: {formatFailureCause(job.relevance_failure_cause)}</p>
             ) : null}
             <p className="supporting-copy">{job.relevance_summary ?? "No relevance rationale stored yet."}</p>

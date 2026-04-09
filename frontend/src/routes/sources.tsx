@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { useAppContext } from "../app/layout";
 import type { Source, SourceCreatePayload } from "../lib/api";
@@ -10,6 +10,8 @@ const initialForm: SourceCreatePayload = {
   base_url: "",
   settings: {},
   active: true,
+  auto_sync_enabled: true,
+  sync_interval_hours: 6,
 };
 
 function normalizeGithubCuratedUrl(sourceType: string, baseUrl: string | null): string | null {
@@ -69,10 +71,38 @@ function displaySourceName(source: Source): string {
   return source.name.trim() || source.source_key;
 }
 
+function formatSyncTimestamp(value: string | null): string {
+  if (!value) {
+    return "Not scheduled yet.";
+  }
+
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) {
+    return value;
+  }
+
+  return timestamp.toLocaleString();
+}
+
+function formatSettingsPreview(settings: Record<string, unknown>): string {
+  const entries = Object.entries(settings);
+  if (entries.length === 0) {
+    return "No extra config.";
+  }
+
+  return JSON.stringify(settings, null, 2);
+}
+
+function getSyncIntervalHours(source: Source): number {
+  return Number.isFinite(source.sync_interval_hours) ? Math.max(1, source.sync_interval_hours) : 6;
+}
+
 export function SourcesRoute() {
   const { api } = useAppContext();
   const [sources, setSources] = useState<Source[]>([]);
+  const [expandedSourceIds, setExpandedSourceIds] = useState<number[]>([]);
   const [form, setForm] = useState(initialForm);
+  const [syncIntervalInput, setSyncIntervalInput] = useState(String(initialForm.sync_interval_hours ?? ""));
   const [editingSourceId, setEditingSourceId] = useState<number | null>(null);
   const [settingsText, setSettingsText] = useState("{}");
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
@@ -81,9 +111,43 @@ export function SourcesRoute() {
   const [syncingSourceId, setSyncingSourceId] = useState<number | null>(null);
   const [pendingDeleteSource, setPendingDeleteSource] = useState<Source | null>(null);
   const [deletingSourceId, setDeletingSourceId] = useState<number | null>(null);
+  const formPanelRef = useRef<HTMLElement | null>(null);
+
+  function loadSourceIntoForm(source: Source, options?: { preserveSyncMessage?: boolean }) {
+    const syncIntervalHours = getSyncIntervalHours(source);
+    setEditingSourceId(source.id);
+    setExpandedSourceIds((current) => (current.includes(source.id) ? current : [...current, source.id]));
+    setForm({
+      source_key: source.source_key,
+      source_type: source.source_type,
+      name: source.name,
+      base_url: source.base_url,
+      settings: source.settings,
+      active: source.active,
+      auto_sync_enabled: source.auto_sync_enabled,
+      sync_interval_hours: syncIntervalHours,
+    });
+    setSyncIntervalInput(String(syncIntervalHours));
+    setSettingsText(JSON.stringify(source.settings, null, 2));
+    setShowAdvancedSettings(Object.keys(source.settings ?? {}).length > 0);
+    setError(null);
+    if (!options?.preserveSyncMessage) {
+      setSyncMessage(null);
+    }
+  }
+
+  function mergeSource(savedSource: Source) {
+    setSources((current) => {
+      const next = current.some((source) => source.id === savedSource.id)
+        ? current.map((source) => (source.id === savedSource.id ? savedSource : source))
+        : [...current, savedSource];
+
+      return [...next].sort((left, right) => left.name.localeCompare(right.name));
+    });
+  }
 
   async function reloadSources() {
-    setSources(await api.listSources());
+    setSources([...(await api.listSources())]);
   }
 
   useEffect(() => {
@@ -97,16 +161,31 @@ export function SourcesRoute() {
     try {
       const settings = JSON.parse(settingsText) as Record<string, unknown>;
       const normalizedBaseUrl = normalizeGithubCuratedUrl(form.source_type, form.base_url);
-      const payload = { ...form, base_url: normalizedBaseUrl, settings };
+      const parsedSyncIntervalHours = syncIntervalInput.trim() ? Number(syncIntervalInput.trim()) : null;
+      const payload = {
+        ...form,
+        base_url: normalizedBaseUrl,
+        settings,
+        sync_interval_hours: parsedSyncIntervalHours,
+      };
+      let savedSource: Source;
       if (editingSourceId !== null) {
-        await api.updateSource(editingSourceId, payload);
+        savedSource = await api.updateSource(editingSourceId, payload);
+        mergeSource(savedSource);
+        setExpandedSourceIds((current) => (current.includes(savedSource.id) ? current : [...current, savedSource.id]));
+        setSyncMessage(`${displaySourceName(savedSource)} updated.`);
+        loadSourceIntoForm(savedSource, { preserveSyncMessage: true });
       } else {
-        await api.createSource(payload);
+        savedSource = await api.createSource(payload);
+        mergeSource(savedSource);
+        setExpandedSourceIds((current) => [...current, savedSource.id]);
+        setSyncMessage(`${displaySourceName(savedSource)} added.`);
+        setEditingSourceId(null);
+        setForm(initialForm);
+        setSyncIntervalInput(String(initialForm.sync_interval_hours ?? ""));
+        setSettingsText("{}");
+        setShowAdvancedSettings(false);
       }
-      setEditingSourceId(null);
-      setForm(initialForm);
-      setSettingsText("{}");
-      setShowAdvancedSettings(false);
       await reloadSources();
     } catch (caughtError) {
       if (caughtError instanceof SyntaxError) {
@@ -124,27 +203,25 @@ export function SourcesRoute() {
   }
 
   function handleEdit(source: Source) {
-    setEditingSourceId(source.id);
-    setForm({
-      source_key: source.source_key,
-      source_type: source.source_type,
-      name: source.name,
-      base_url: source.base_url,
-      settings: source.settings,
-      active: source.active,
-    });
-    setSettingsText(JSON.stringify(source.settings, null, 2));
-    setShowAdvancedSettings(Object.keys(source.settings ?? {}).length > 0);
-    setError(null);
-    setSyncMessage(null);
+    loadSourceIntoForm(source);
+    if (typeof formPanelRef.current?.scrollIntoView === "function") {
+      formPanelRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
   }
 
   function handleCancelEdit() {
     setEditingSourceId(null);
     setForm(initialForm);
+    setSyncIntervalInput(String(initialForm.sync_interval_hours ?? ""));
     setSettingsText("{}");
     setShowAdvancedSettings(false);
     setError(null);
+  }
+
+  function toggleSourceDetails(sourceId: number) {
+    setExpandedSourceIds((current) =>
+      current.includes(sourceId) ? current.filter((id) => id !== sourceId) : [...current, sourceId],
+    );
   }
 
   async function handleSync(source: Source) {
@@ -153,10 +230,29 @@ export function SourcesRoute() {
 
     try {
       const summary = await api.syncSource(source.id);
-      await reloadSources();
-      setSyncMessage(
-        `${source.name} synced: ${summary.processed} processed, ${summary.created} new, ${summary.updated} updated.`,
+      setSources((current) =>
+        current.map((item) =>
+          item.id === source.id
+            ? {
+                ...item,
+                last_synced_at: summary.last_synced_at,
+                next_sync_at: summary.next_sync_at,
+              }
+            : item,
+        ),
       );
+      const pendingBits: string[] = [];
+      if (summary.pending_title_screening) {
+        pendingBits.push(`${summary.pending_title_screening} pending title screen`);
+      }
+      if (summary.pending_full_relevance) {
+        pendingBits.push(`${summary.pending_full_relevance} pending relevance`);
+      }
+      const pendingSuffix = pendingBits.length > 0 ? ` ${pendingBits.join(", ")}.` : "";
+      setSyncMessage(
+        `${source.name} synced: ${summary.processed} processed, ${summary.created} new, ${summary.updated} updated.${pendingSuffix}`,
+      );
+      await reloadSources();
     } catch (caughtError) {
       if (caughtError instanceof Error) {
         setSyncMessage(caughtError.message);
@@ -220,75 +316,147 @@ export function SourcesRoute() {
             <p className="empty-copy">No sources configured yet.</p>
           ) : (
             <ul className="stack-list">
-              {sources.map((source) => (
-                <li
-                  key={source.id}
-                  className={`stack-row stack-row-column source-card${
-                    syncingSourceId === source.id ? " source-card-syncing" : ""
-                  }`}
-                >
-                  <div className="source-card-head">
-                    <div className="source-card-topline">
-                      <strong>{displaySourceName(source)}</strong>
-                      <span className="source-type-pill">{formatSourceType(source.source_type)}</span>
+              {sources.map((source) => {
+                const isExpanded = expandedSourceIds.includes(source.id);
+                const syncIntervalHours = getSyncIntervalHours(source);
+
+                return (
+                  <li
+                    key={source.id}
+                    className={`stack-row stack-row-column source-card${
+                      syncingSourceId === source.id ? " source-card-syncing" : ""
+                    }`}
+                  >
+                    <div className="source-card-summary">
+                      <div className="source-card-head">
+                        <div className="source-card-topline">
+                          <strong>{displaySourceName(source)}</strong>
+                        </div>
+                        {source.name.trim() && source.name.trim() !== source.source_key ? (
+                          <p className="source-key-line">{source.source_key}</p>
+                        ) : null}
+                        <p className="source-summary-line">
+                          {source.active
+                            ? source.auto_sync_enabled
+                              ? `Auto-sync every ${syncIntervalHours} hour${syncIntervalHours === 1 ? "" : "s"}`
+                              : "Auto-sync off"
+                            : "Inactive"}
+                        </p>
+                      </div>
+                      <div className="source-summary-actions">
+                        <span className="source-type-pill">{formatSourceType(source.source_type)}</span>
+                        <button
+                          type="button"
+                          className="ghost-button source-disclosure-button"
+                          onClick={() => toggleSourceDetails(source.id)}
+                          aria-expanded={isExpanded}
+                          aria-controls={`source-details-${source.id}`}
+                        >
+                          <span
+                            className={`source-disclosure-icon${isExpanded ? " source-disclosure-icon-open" : ""}`}
+                            aria-hidden="true"
+                          />
+                          {isExpanded ? "Hide details" : "Show details"}
+                        </button>
+                      </div>
                     </div>
-                    {source.name.trim() && source.name.trim() !== source.source_key ? (
-                      <p className="source-key-line">{source.source_key}</p>
+
+                    {isExpanded ? (
+                      <div id={`source-details-${source.id}`} className="source-details">
+                        <div className="source-link-block">
+                          <span className="source-link-label">Monitored URL</span>
+                          <p className="source-link-value">{source.base_url ?? "No base URL yet."}</p>
+                        </div>
+                        <div className="source-link-block">
+                          <span className="source-link-label">Status</span>
+                          <p className="source-link-value">
+                            {source.active ? (source.auto_sync_enabled ? "Active with auto-sync" : "Active with auto-sync off") : "Inactive"}
+                          </p>
+                        </div>
+                        <div className="source-link-block">
+                          <span className="source-link-label">Sync interval</span>
+                          <p className="source-link-value">
+                            Every {syncIntervalHours} hour{syncIntervalHours === 1 ? "" : "s"}
+                          </p>
+                        </div>
+                        <div className="source-link-block">
+                          <span className="source-link-label">Last sync</span>
+                          <p className="source-link-value">{formatSyncTimestamp(source.last_synced_at)}</p>
+                        </div>
+                        <div className="source-link-block">
+                          <span className="source-link-label">Next sync</span>
+                          <p className="source-link-value">
+                            {source.active ? formatSyncTimestamp(source.next_sync_at) : "Paused while source is inactive"}
+                          </p>
+                        </div>
+                        <div className="source-link-block">
+                          <span className="source-link-label">Config</span>
+                          <pre className="source-config-preview">{formatSettingsPreview(source.settings)}</pre>
+                        </div>
+                      </div>
                     ) : null}
-                  </div>
-                  <div className="source-link-block">
-                    <span className="source-link-label">Monitored URL</span>
-                    <p className="source-link-value">{source.base_url ?? "No base URL yet."}</p>
-                  </div>
-                  {syncingSourceId === source.id ? (
-                    <div className="source-sync-status" role="status" aria-live="polite">
-                      <span className="source-sync-pulse" aria-hidden="true" />
-                      Checking this source for new jobs and updating relevance.
+
+                    {syncingSourceId === source.id ? (
+                      <div className="source-sync-status" role="status" aria-live="polite">
+                        <span className="source-sync-pulse" aria-hidden="true" />
+                        Checking this source for new jobs and updating relevance.
+                      </div>
+                    ) : !source.active ? (
+                      <div className="source-sync-status" role="status" aria-live="polite">
+                        Source is inactive, so scheduled and manual sync are paused.
+                      </div>
+                    ) : null}
+
+                    <div className="button-row source-card-actions">
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => handleEdit(source)}
+                        disabled={syncingSourceId === source.id}
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        onClick={() => void handleDelete(source)}
+                        disabled={syncingSourceId === source.id}
+                      >
+                        Delete
+                      </button>
+                      <button
+                        type="button"
+                        className={`source-primary-button${syncingSourceId === source.id ? " source-sync-button" : ""}`}
+                        onClick={() => void handleSync(source)}
+                        disabled={syncingSourceId === source.id || !source.active}
+                      >
+                        {syncingSourceId === source.id ? (
+                          <>
+                            <span className="button-spinner" aria-hidden="true" />
+                            Syncing source
+                          </>
+                        ) : !source.active ? (
+                          "Reactivate to sync"
+                        ) : (
+                          "Sync now"
+                        )}
+                      </button>
                     </div>
-                  ) : null}
-                  <div className="button-row source-card-actions">
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      onClick={() => handleEdit(source)}
-                      disabled={syncingSourceId === source.id}
-                    >
-                      Edit
-                    </button>
-                    <button
-                      type="button"
-                      className="ghost-button"
-                      onClick={() => void handleDelete(source)}
-                      disabled={syncingSourceId === source.id}
-                    >
-                      Delete
-                    </button>
-                    <button
-                      type="button"
-                      className={`source-primary-button${
-                        syncingSourceId === source.id ? " source-sync-button" : ""
-                      }`}
-                      onClick={() => void handleSync(source)}
-                      disabled={syncingSourceId === source.id}
-                    >
-                      {syncingSourceId === source.id ? (
-                        <>
-                          <span className="button-spinner" aria-hidden="true" />
-                          Syncing source
-                        </>
-                      ) : (
-                        "Sync now"
-                      )}
-                    </button>
-                  </div>
-                </li>
-              ))}
+                  </li>
+                );
+              })}
             </ul>
           )}
         </article>
 
-        <article className="panel-card">
+        <article className="panel-card" ref={formPanelRef}>
           <h2>{editingSourceId !== null ? "Edit source" : "Add source"}</h2>
+          {editingSourceId !== null ? (
+            <p className="supporting-copy">
+              Editing <strong>{form.name.trim() || form.source_key || "selected source"}</strong>. Save changes will
+              update this source instead of creating a new one.
+            </p>
+          ) : null}
           <form className="form-grid" onSubmit={handleSubmit}>
             <label>
               <span>Source key</span>
@@ -323,6 +491,61 @@ export function SourcesRoute() {
                 onChange={(event) => setForm((current) => ({ ...current, base_url: event.target.value }))}
               />
             </label>
+
+            <div className="full-width source-form-controls">
+              <label className="source-toggle-row">
+                <span>Active</span>
+                <input
+                  type="checkbox"
+                  checked={form.active}
+                  onChange={(event) =>
+                    setForm((current) => ({
+                      ...current,
+                      active: event.target.checked,
+                      auto_sync_enabled: event.target.checked ? current.auto_sync_enabled : false,
+                    }))
+                  }
+                />
+              </label>
+
+              <label className={`source-toggle-row${!form.active ? " source-toggle-row-disabled" : ""}`}>
+                <span>Auto-sync</span>
+                <input
+                  type="checkbox"
+                  checked={form.auto_sync_enabled}
+                  onChange={(event) => {
+                    if (event.target.checked && !syncIntervalInput.trim()) {
+                      setSyncIntervalInput("6");
+                    }
+                    setForm((current) => ({
+                      ...current,
+                      auto_sync_enabled: event.target.checked,
+                    }));
+                  }}
+                  disabled={!form.active}
+                />
+              </label>
+
+              <label className={`source-inline-field${!form.active ? " source-inline-field-disabled" : ""}`}>
+                <span>Sync every</span>
+                <div className="source-hours-shell">
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    value={syncIntervalInput}
+                    onChange={(event) => {
+                      const nextValue = event.target.value.replace(/[^\d]/g, "");
+                      setSyncIntervalInput(nextValue);
+                    }}
+                    disabled={!form.active}
+                    aria-label="Sync every hours"
+                  />
+                  <span className="source-hours-suffix">hours</span>
+                </div>
+              </label>
+            </div>
+
             {form.source_type === "github_curated" ? (
               <p className="supporting-copy full-width">
                 Paste the repo README raw URL or a normal GitHub README link. The form will convert

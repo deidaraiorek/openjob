@@ -55,6 +55,12 @@ class Job(TimestampMixin, Base):
         cascade="all, delete-orphan",
         order_by="JobRelevanceEvaluation.id.desc()",
     )
+    relevance_tasks = relationship(
+        "JobRelevanceTask",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        order_by="JobRelevanceTask.id.asc()",
+    )
 
 
 class JobSighting(Base):
@@ -64,6 +70,7 @@ class JobSighting(Base):
     job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), index=True)
     source_id: Mapped[int | None] = mapped_column(ForeignKey("job_sources.id"), nullable=True)
     external_job_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    normalized_url: Mapped[str] = mapped_column(String(500), index=True, default="")
     listing_url: Mapped[str] = mapped_column(String(500))
     apply_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -105,3 +112,23 @@ class JobRelevanceEvaluation(TimestampMixin, Base):
 
     account = relationship("Account")
     job = relationship("Job", back_populates="relevance_evaluations")
+
+
+class JobRelevanceTask(TimestampMixin, Base):
+    __tablename__ = "job_relevance_tasks"
+    __table_args__ = (
+        UniqueConstraint("job_id", "phase", name="uq_job_relevance_tasks_job_phase"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), index=True)
+    phase: Mapped[str] = mapped_column(String(32))
+    available_at: Mapped[datetime] = mapped_column(default=utcnow, index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(nullable=True, index=True)
+    attempt_count: Mapped[int] = mapped_column(default=0)
+    last_failure_cause: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    account = relationship("Account")
+    job = relationship("Job", back_populates="relevance_tasks")

@@ -5,6 +5,7 @@ import { RouterProvider } from "react-router-dom";
 import { createMemoryAppRouter } from "../app/router";
 import type {
   ActionNeededItem,
+  AnswerFileUploadPayload,
   AppApi,
   AnswerEntry,
   JobDetail,
@@ -26,6 +27,10 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
       base_url: "https://boards.greenhouse.io/acme",
       settings: {},
       active: true,
+      auto_sync_enabled: true,
+      sync_interval_hours: 6,
+      last_synced_at: "2026-04-08T08:00:00Z",
+      next_sync_at: "2026-04-08T14:00:00Z",
     },
   ];
   const answers: AnswerEntry[] = [
@@ -62,6 +67,7 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
       relevance_score: 0.92,
       relevance_summary: "Strong match.",
       relevance_failure_cause: null,
+      relevance_decision_phase: null,
       preferred_apply_target_type: "greenhouse_apply",
       sighting_count: 2,
       open_question_task_count: 1,
@@ -80,6 +86,7 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
     relevance_score: 0.92,
     relevance_summary: "Strong match.",
     relevance_failure_cause: null,
+    relevance_decision_phase: null,
     sightings: [],
     preferred_apply_target: {
       id: 1,
@@ -100,6 +107,7 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
         concerns: [],
         model_name: "groq-test",
         failure_cause: null,
+        decision_phase: null,
       },
     ],
   };
@@ -130,7 +138,13 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
     logout: async () => undefined,
     listSources: async () => sources,
     createSource: async (payload) => {
-      const next = { id: sources.length + 1, ...payload };
+      const next = {
+        id: sources.length + 1,
+        last_synced_at: null,
+        next_sync_at: payload.active && payload.auto_sync_enabled ? "2026-04-08T14:00:00Z" : null,
+        sync_interval_hours: payload.sync_interval_hours ?? 6,
+        ...payload,
+      };
       sources.push(next);
       return next;
     },
@@ -147,6 +161,8 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
     },
     syncSource: async (sourceId) => {
       const source = sources.find((item) => item.id === sourceId)!;
+      source.last_synced_at = "2026-04-08T10:30:00Z";
+      source.next_sync_at = source.active && source.auto_sync_enabled ? "2026-04-08T16:30:00Z" : null;
       const summary: SourceSyncResult = {
         source_id: source.id,
         source_key: source.source_key,
@@ -154,6 +170,10 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
         processed: 6,
         created: 2,
         updated: 4,
+        pending_title_screening: 1,
+        pending_full_relevance: 3,
+        last_synced_at: source.last_synced_at,
+        next_sync_at: source.next_sync_at,
       };
       return summary;
     },
@@ -162,6 +182,21 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
     listAnswers: async () => answers,
     createAnswer: async (payload) => {
       const next = { id: answers.length + 1, ...payload };
+      answers.push(next);
+      return next;
+    },
+    uploadAnswerFile: async (payload: AnswerFileUploadPayload) => {
+      const next = {
+        id: answers.length + 1,
+        question_template_id: payload.question_template_id,
+        label: payload.label,
+        answer_text: null,
+        answer_payload: {
+          kind: "file",
+          filename: payload.file.name,
+          mime_type: payload.file.type || "application/octet-stream",
+        },
+      };
       answers.push(next);
       return next;
     },
@@ -198,6 +233,7 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
         relevance_score: job.relevance_score,
         relevance_summary: job.relevance_summary,
         relevance_failure_cause: job.relevance_failure_cause,
+        relevance_decision_phase: null,
       };
     },
     rescoreJob: async (jobId) => ({
@@ -207,6 +243,7 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
       relevance_score: 0.5,
       relevance_summary: "Needs review.",
       relevance_failure_cause: null,
+      relevance_decision_phase: null,
     }),
     triggerJobApplication: async (jobId) => {
       const job = jobs.find((item) => item.id === jobId)!;
@@ -223,7 +260,10 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
     ...overrides,
   };
 
-  return api;
+  return {
+    ...api,
+    uploadAnswerFile: overrides?.uploadAnswerFile ?? api.uploadAnswerFile,
+  };
 }
 
 test("renders the jobs route inside the portal layout", async () => {
@@ -255,6 +295,7 @@ test("creates a new source from the sources screen", async () => {
     target: { value: '{"company_slug":"acme"}' },
   });
   await user.click(screen.getByRole("button", { name: /save source/i }));
+  await user.click(screen.getAllByRole("button", { name: /show details/i })[1]);
 
   await waitFor(() => {
     expect(screen.getByText("https://jobs.lever.co/acme")).toBeInTheDocument();
@@ -276,6 +317,11 @@ test("edits an existing source from the sources screen", async () => {
     baseUrlField,
     "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/README.md",
   );
+  await user.click(screen.getByRole("button", { name: /show advanced settings/i }));
+  await user.clear(screen.getByLabelText(/settings json/i));
+  fireEvent.change(screen.getByLabelText(/settings json/i), {
+    target: { value: '{"board_token":"updated-token"}' },
+  });
   await user.click(screen.getByRole("button", { name: /save changes/i }));
 
   await waitFor(() => {
@@ -285,6 +331,64 @@ test("edits an existing source from the sources screen", async () => {
       ),
     ).toBeInTheDocument();
   });
+  expect(screen.getByText(/greenhouse updated\./i)).toBeInTheDocument();
+  expect(screen.getAllByText(/"board_token": "updated-token"/i)).not.toHaveLength(0);
+  expect(screen.getByRole("heading", { name: /edit source/i })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /save changes/i })).toBeInTheDocument();
+});
+
+test("edits the sync interval from the sources screen", async () => {
+  const user = userEvent.setup();
+  const router = createMemoryAppRouter(createMockApi(), ["/sources"]);
+
+  render(<RouterProvider router={router} />);
+
+  await screen.findByRole("heading", { name: /discovery inputs/i });
+  await user.click(await screen.findByRole("button", { name: /^edit$/i }));
+
+  const syncIntervalField = screen.getByRole("textbox", { name: /sync every hours/i });
+  await user.clear(syncIntervalField);
+  await user.type(syncIntervalField, "12");
+  await user.click(screen.getByRole("button", { name: /save changes/i }));
+
+  await waitFor(() => {
+    expect(screen.getByText(/auto-sync every 12 hours/i)).toBeInTheDocument();
+  });
+});
+
+test("expanded source details reflect saved status config after edit", async () => {
+  const user = userEvent.setup();
+  const router = createMemoryAppRouter(createMockApi(), ["/sources"]);
+
+  render(<RouterProvider router={router} />);
+
+  await screen.findByRole("heading", { name: /discovery inputs/i });
+  await user.click(await screen.findByRole("button", { name: /^edit$/i }));
+  await user.click(screen.getByRole("checkbox", { name: /auto-sync/i }));
+  await user.clear(screen.getByRole("textbox", { name: /sync every hours/i }));
+  await user.type(screen.getByRole("textbox", { name: /sync every hours/i }), "18");
+  await user.click(screen.getByRole("button", { name: /save changes/i }));
+
+  expect(screen.getByText(/^auto-sync off$/i)).toBeInTheDocument();
+  expect(screen.getByText(/active with auto-sync off/i)).toBeInTheDocument();
+  expect(screen.getByText(/every 18 hours/i)).toBeInTheDocument();
+});
+
+test("allows editing the sync interval while auto-sync is off", async () => {
+  const user = userEvent.setup();
+  const router = createMemoryAppRouter(createMockApi(), ["/sources"]);
+
+  render(<RouterProvider router={router} />);
+
+  await screen.findByRole("heading", { name: /discovery inputs/i });
+  await user.click(await screen.findByRole("button", { name: /^edit$/i }));
+  await user.click(screen.getByRole("checkbox", { name: /auto-sync/i }));
+
+  const syncIntervalField = screen.getByRole("textbox", { name: /sync every hours/i });
+  expect(syncIntervalField).toBeEnabled();
+  await user.clear(syncIntervalField);
+  await user.type(syncIntervalField, "18");
+  expect(syncIntervalField).toHaveValue("18");
 });
 
 test("normalizes github blob urls when editing a github curated source", async () => {
@@ -301,6 +405,10 @@ test("normalizes github blob urls when editing a github curated source", async (
           base_url: "https://github.com/SimplifyJobs/New-Grad-Positions/blob/dev/README.md",
           settings: {},
           active: true,
+          auto_sync_enabled: true,
+          sync_interval_hours: 6,
+          last_synced_at: null,
+          next_sync_at: "2026-04-08T14:00:00Z",
         },
       ],
       updateSource: async (sourceId, payload) => {
@@ -359,6 +467,71 @@ test("syncs a source from the sources screen", async () => {
   });
 });
 
+test("manual sync updates the displayed last sync timestamp", async () => {
+  const user = userEvent.setup();
+  const router = createMemoryAppRouter(createMockApi(), ["/sources"]);
+
+  render(<RouterProvider router={router} />);
+
+  await screen.findByRole("heading", { name: /discovery inputs/i });
+  await user.click(await screen.findByRole("button", { name: /show details/i }));
+
+  expect(screen.getByText("4/8/2026, 4:00:00 AM")).toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: /sync now/i }));
+
+  await waitFor(() => {
+    expect(screen.getByText("4/8/2026, 6:30:00 AM")).toBeInTheDocument();
+  });
+  expect(screen.getByText("4/8/2026, 12:30:00 PM")).toBeInTheDocument();
+});
+
+test("shows auto-sync controls and sync schedule details on the sources screen", async () => {
+  const user = userEvent.setup();
+  const router = createMemoryAppRouter(createMockApi(), ["/sources"]);
+
+  render(<RouterProvider router={router} />);
+
+  await screen.findByRole("heading", { name: /discovery inputs/i });
+  await screen.findByRole("button", { name: /show details/i });
+  expect(screen.getByLabelText(/auto-sync/i)).toBeInTheDocument();
+  expect(screen.getByLabelText(/sync every/i)).toBeInTheDocument();
+  expect(screen.queryByText(/last sync/i)).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /show details/i }));
+  expect(screen.getByText(/last sync/i)).toBeInTheDocument();
+  expect(screen.getByText(/next sync/i)).toBeInTheDocument();
+});
+
+test("disables manual sync affordance for inactive sources", async () => {
+  const user = userEvent.setup();
+  const router = createMemoryAppRouter(
+    createMockApi({
+      listSources: async () => [
+        {
+          id: 1,
+          source_key: "paused-source",
+          source_type: "greenhouse_board",
+          name: "Paused Source",
+          base_url: "https://boards.greenhouse.io/paused",
+          settings: {},
+          active: false,
+          auto_sync_enabled: true,
+          sync_interval_hours: 6,
+          last_synced_at: null,
+          next_sync_at: null,
+        },
+      ],
+    }),
+    ["/sources"],
+  );
+
+  render(<RouterProvider router={router} />);
+
+  expect(await screen.findByRole("button", { name: /reactivate to sync/i })).toBeDisabled();
+  await user.click(screen.getByRole("button", { name: /show details/i }));
+  expect(screen.getByText(/scheduled and manual sync are paused/i)).toBeInTheDocument();
+});
+
 test("deletes a source from the sources screen", async () => {
   const user = userEvent.setup();
   const router = createMemoryAppRouter(createMockApi(), ["/sources"]);
@@ -393,6 +566,7 @@ test("saves the role profile from the role-profile screen", async () => {
 
   render(<RouterProvider router={router} />);
 
+  expect(await screen.findByRole("heading", { name: /centralized user profile/i })).toBeInTheDocument();
   const promptField = await screen.findByLabelText(/prompt/i);
   fireEvent.change(promptField, {
     target: { value: "early career platform engineer" },
@@ -400,7 +574,7 @@ test("saves the role profile from the role-profile screen", async () => {
   await user.click(screen.getByRole("button", { name: /save role profile/i }));
 
   await waitFor(() => {
-    expect(screen.getByText(/saved/i)).toBeInTheDocument();
+    expect(screen.getByText(/^saved$/i)).toBeInTheDocument();
   });
   expect(savedPrompt).toBe("early career platform engineer");
   expect(savedTitles).toEqual([]);
@@ -411,11 +585,29 @@ test("role profile screen no longer shows generated title controls", async () =>
 
   render(<RouterProvider router={router} />);
 
-  await screen.findByRole("heading", { name: /targeting memory/i });
+  await screen.findByRole("heading", { name: /centralized user profile/i });
+  expect(screen.getByRole("tab", { name: /role profile/i })).toHaveAttribute("aria-selected", "true");
+  expect(screen.getByRole("tab", { name: /saved answers/i })).toHaveAttribute("aria-selected", "false");
 
   expect(screen.queryByRole("button", { name: /generate with ai/i })).not.toBeInTheDocument();
   expect(screen.queryByLabelText(/generated titles/i)).not.toBeInTheDocument();
   expect(screen.getByText(/screened in ai batches against this prompt first/i)).toBeInTheDocument();
+});
+
+test("answers live under the profile screen", async () => {
+  const user = userEvent.setup();
+  const router = createMemoryAppRouter(createMockApi(), ["/role-profile?tab=answers"]);
+
+  render(<RouterProvider router={router} />);
+
+  expect(await screen.findByRole("heading", { name: /centralized user profile/i })).toBeInTheDocument();
+  expect(screen.getByRole("tab", { name: /saved answers/i })).toHaveAttribute("aria-selected", "true");
+  expect(await screen.findByText(/portfolio url/i)).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: /add answer/i })).toBeInTheDocument();
+
+  await user.click(screen.getByRole("tab", { name: /role profile/i }));
+  expect(screen.getByRole("tab", { name: /role profile/i })).toHaveAttribute("aria-selected", "true");
+  expect(screen.getByLabelText(/prompt/i)).toBeInTheDocument();
 });
 
 test("shows action-needed runs in the operator queue", async () => {
@@ -461,6 +653,7 @@ test("shows discovery-only jobs as non-runnable", async () => {
           relevance_score: 0.92,
           relevance_summary: "Strong match.",
           relevance_failure_cause: null,
+          relevance_decision_phase: null,
           preferred_apply_target_type: "external_link",
           sighting_count: 2,
           open_question_task_count: 0,
@@ -507,6 +700,7 @@ test("shows a single recovery action for rejected jobs", async () => {
           relevance_score: 0.18,
           relevance_summary: "This role sits outside the software engineering profile.",
           relevance_failure_cause: null,
+          relevance_decision_phase: null,
           preferred_apply_target_type: "greenhouse_apply",
           sighting_count: 1,
           open_question_task_count: 0,
@@ -565,4 +759,125 @@ test("renders multi-select question choices and saves structured answers", async
       answer_payload: { values: ["LinkedIn", "School"] },
     });
   });
+});
+
+test("stages a saved answer and waits for save before linking", async () => {
+  const user = userEvent.setup();
+  let resolvedAnswerId: number | null = null;
+  const router = createMemoryAppRouter(
+    createMockApi({
+      listAnswers: async () => [
+        {
+          id: 7,
+          question_template_id: 70,
+          label: "Phone",
+          answer_text: "555-0100",
+          answer_payload: {},
+        },
+      ],
+      listQuestionTasks: async () => [
+        {
+          id: 4,
+          question_template_id: 70,
+          question_fingerprint: "phone",
+          prompt_text: "Phone",
+          field_type: "input_text",
+          option_labels: [],
+          status: "new",
+          linked_answer_entry_id: null,
+        },
+      ],
+      resolveQuestionTask: async (taskId, payload) => {
+        resolvedAnswerId = payload.linked_answer_entry_id;
+        return {
+          id: taskId,
+          question_template_id: 70,
+          question_fingerprint: "phone",
+          prompt_text: "Phone",
+          field_type: "input_text",
+          option_labels: [],
+          status: payload.status,
+          linked_answer_entry_id: payload.linked_answer_entry_id,
+        };
+      },
+    }),
+    ["/questions"],
+  );
+
+  render(<RouterProvider router={router} />);
+
+  expect(await screen.findByText(/use a saved answer/i)).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /^phone$/i }));
+
+  expect(screen.getByDisplayValue("555-0100")).toBeInTheDocument();
+  expect(screen.getByLabelText(/label for task 4/i)).toHaveValue("Phone");
+  expect(resolvedAnswerId).toBeNull();
+
+  await user.click(screen.getByRole("button", { name: /save and link/i }));
+
+  await waitFor(() => {
+    expect(resolvedAnswerId).toBe(7);
+  });
+});
+
+test("uploads and links file answers for resume questions", async () => {
+  const user = userEvent.setup();
+  let uploadedFileName: string | null = null;
+  let resolvedAnswerId: number | null = null;
+  const router = createMemoryAppRouter(
+    createMockApi({
+      listQuestionTasks: async () => [
+        {
+          id: 3,
+          question_template_id: 30,
+          question_fingerprint: "resume",
+          prompt_text: "Resume/CV",
+          field_type: "input_file",
+          option_labels: [],
+          status: "new",
+          linked_answer_entry_id: null,
+        },
+      ],
+      uploadAnswerFile: async (payload: AnswerFileUploadPayload) => {
+        uploadedFileName = payload.file.name;
+        return {
+          id: 3,
+          question_template_id: payload.question_template_id,
+          label: payload.label,
+          answer_text: null,
+          answer_payload: {
+            kind: "file",
+            filename: payload.file.name,
+            mime_type: payload.file.type || "application/octet-stream",
+          },
+        };
+      },
+      resolveQuestionTask: async (taskId, payload) => {
+        resolvedAnswerId = payload.linked_answer_entry_id;
+        return {
+          id: taskId,
+          question_template_id: 30,
+          question_fingerprint: "resume",
+          prompt_text: "Resume/CV",
+          field_type: "input_file",
+          option_labels: [],
+          status: payload.status,
+          linked_answer_entry_id: payload.linked_answer_entry_id,
+        };
+      },
+    }),
+    ["/questions"],
+  );
+
+  render(<RouterProvider router={router} />);
+
+  expect(await screen.findByText(/upload a file/i)).toBeInTheDocument();
+  const file = new File(["resume"], "resume.pdf", { type: "application/pdf" });
+  await user.upload(screen.getByLabelText(/file upload for task 3/i), file);
+  await user.click(screen.getByRole("button", { name: /upload and link/i }));
+
+  await waitFor(() => {
+    expect(uploadedFileName).toBe("resume.pdf");
+  });
+  expect(resolvedAnswerId).toBe(3);
 });

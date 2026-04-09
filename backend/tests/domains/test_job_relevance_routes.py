@@ -39,16 +39,29 @@ def test_job_list_filters_by_relevance(auth_client, db_session) -> None:
                 relevance_source="ai",
                 relevance_summary="Out of scope.",
             ),
+            Job(
+                account_id=account.id,
+                canonical_key="pending-job",
+                company_name="SlowAI",
+                title="Junior Software Developer",
+                location="Remote",
+                status="discovered",
+                relevance_decision="pending",
+                relevance_source="pending_full_relevance",
+                relevance_summary="Waiting for full AI relevance review.",
+            ),
         ]
     )
     db_session.commit()
 
     review_response = auth_client.get("/api/jobs?relevance=review")
     reject_response = auth_client.get("/api/jobs?relevance=reject")
+    pending_response = auth_client.get("/api/jobs?relevance=pending")
     active_response = auth_client.get("/api/jobs")
 
     assert [job["title"] for job in review_response.json()] == ["Engineer"]
     assert [job["title"] for job in reject_response.json()] == ["Hardware Engineer"]
+    assert [job["title"] for job in pending_response.json()] == ["Junior Software Developer"]
     assert [job["title"] for job in active_response.json()] == ["Engineer", "Software Engineer I"]
 
 

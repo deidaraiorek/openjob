@@ -30,6 +30,19 @@ function formatLabel(value: string | null, fallback = "None"): string {
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+function formatPendingPhase(value: string | null | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+  if (value === "title_screening") {
+    return "Waiting on AI title screening";
+  }
+  if (value === "full_relevance") {
+    return "Waiting on full AI relevance";
+  }
+  return formatLabel(value);
+}
+
 function formatLatestRun(job: JobListItem): string {
   if (!job.latest_application_run_status) {
     return "No runs yet";
@@ -42,6 +55,13 @@ function getJobActionConfig(job: JobListItem): {
   primaryAction: { label: string; decision: "match" | "reject"; className: string };
   secondaryAction: { label: string; decision: "match" | "reject"; className: string } | null;
 } {
+  if (job.relevance_decision === "pending") {
+    return {
+      primaryAction: { label: "Include", decision: "match", className: "secondary-button" },
+      secondaryAction: { label: "Exclude", decision: "reject", className: "ghost-button" },
+    };
+  }
+
   if (job.relevance_decision === "reject") {
     return {
       primaryAction: { label: "Include", decision: "match", className: "secondary-button" },
@@ -65,7 +85,7 @@ function getJobActionConfig(job: JobListItem): {
 export function JobsRoute() {
   const { api } = useAppContext();
   const [jobs, setJobs] = useState<JobListItem[]>([]);
-  const [relevanceFilter, setRelevanceFilter] = useState("active");
+  const [relevanceFilter, setRelevanceFilter] = useState("match");
   const [runMessage, setRunMessage] = useState<string | null>(null);
   const [runningJobId, setRunningJobId] = useState<number | null>(null);
   const [updatingJobId, setUpdatingJobId] = useState<number | null>(null);
@@ -129,7 +149,7 @@ export function JobsRoute() {
           </div>
           <div className="button-row">
             {[
-              { key: "active", label: "Match + Review" },
+              { key: "pending", label: "Pending" },
               { key: "match", label: "Match" },
               { key: "review", label: "Review" },
               { key: "reject", label: "Reject" },
@@ -185,7 +205,13 @@ export function JobsRoute() {
                       {formatLabel(job.relevance_decision)}
                     </span>
                     <p className="job-card-summary">{job.relevance_summary ?? "No rationale yet."}</p>
-                    {formatFailureCause(job.relevance_failure_cause) ? (
+                    {job.relevance_decision === "pending" && formatPendingPhase(job.pending_relevance_phase) ? (
+                      <p className="job-card-subtle">
+                        {formatPendingPhase(job.pending_relevance_phase)}
+                        {job.pending_relevance_attempt_count ? ` · attempt ${job.pending_relevance_attempt_count + 1}` : ""}
+                      </p>
+                    ) : null}
+                    {job.relevance_decision !== "pending" && formatFailureCause(job.relevance_failure_cause) ? (
                       <p className="job-card-subtle">
                         Temporary issue: {formatFailureCause(job.relevance_failure_cause)}
                       </p>

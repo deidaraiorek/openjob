@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.celery_app import celery_app
@@ -10,15 +10,20 @@ from app.config import get_settings
 from app.domains.accounts.service import ensure_account
 from app.domains.jobs.deduplication import DiscoveryCandidate, ingest_candidate, resolve_existing_job
 from app.domains.jobs.relevance import (
-    apply_relevance_result,
     cached_relevance_for_job,
-    queued_relevance_result,
-    screen_candidate_titles,
-    title_screen_reject_result,
+    delete_relevance_task,
+    mark_job_pending,
+    upsert_relevance_task,
 )
-from app.domains.jobs.models import Job
+from app.domains.jobs.models import Job, JobRelevanceTask
 from app.domains.role_profiles.models import RoleProfile
 from app.domains.sources.models import JobSource
+from app.domains.sources.sync_control import (
+    acquire_source_sync_lease,
+    mark_source_synced,
+    release_source_sync_lease,
+    select_due_source_ids,
+)
 from app.domains.sources.url_normalization import (
     derive_greenhouse_board_token,
     derive_lever_company_slug,
@@ -32,7 +37,7 @@ from app.integrations.greenhouse.client import parse_jobs as parse_greenhouse_jo
 from app.integrations.lever.client import fetch_postings as fetch_lever_postings
 from app.integrations.lever.client import parse_postings as parse_lever_postings
 from app.integrations.linkedin.discovery import parse_search_results as parse_linkedin_search_results
-from app.tasks.job_relevance import evaluate_job_batch_now
+from app.tasks.job_relevance import drain_relevance_tasks_for_account, drain_relevance_tasks_now
 HARD_REJECT_SCORE_THRESHOLD = 0.15
 
 
@@ -94,18 +99,52 @@ def load_candidates(source: JobSource, raw_payload: Any = None) -> list[Discover
     raise ValueError(f"Unsupported source type: {source.source_type}")
 
 
+def _requeue_system_fallback_reviews(session: Session, *, account_id: int) -> int:
+    from sqlalchemy.orm import selectinload as _selectinload
+    jobs = session.scalars(
+        select(Job)
+        .where(
+            Job.account_id == account_id,
+            Job.relevance_decision == "review",
+            Job.relevance_source == "system_fallback",
+        )
+        .options(_selectinload(Job.relevance_tasks))
+    ).all()
+
+    requeued = 0
+    for job in jobs:
+        if any(t.phase == "title_screening" for t in job.relevance_tasks):
+            continue
+        mark_job_pending(job, phase="title_screening")
+        upsert_relevance_task(
+            session,
+            account_id=account_id,
+            job_id=job.id,
+            phase="title_screening",
+            reset_attempts=True,
+        )
+        requeued += 1
+    return requeued
+
+
 def sync_source(session: Session, source_id: int, raw_payload: Any = None) -> dict[str, int]:
+    settings = get_settings()
     source = session.get(JobSource, source_id)
     if not source:
         raise ValueError(f"Unknown source: {source_id}")
     if not source.active:
-        return {"processed": 0, "created": 0, "updated": 0}
+        return {
+            "processed": 0,
+            "created": 0,
+            "updated": 0,
+            "pending_title_screening": 0,
+            "pending_full_relevance": 0,
+        }
 
-    account = ensure_account(session, session.get(JobSource, source_id).account.email if source.account else "owner@example.com")
+    account = ensure_account(session, source.account.email if source.account else "owner@example.com")
     profile = _load_role_profile(session, source)
     candidates = load_candidates(source, raw_payload=raw_payload)
-    screened_titles = screen_candidate_titles(profile, candidates)
-    queued_job_ids: list[int] = []
+    touched_job_ids: list[int] = []
 
     processed = 0
     created = 0
@@ -127,7 +166,6 @@ def sync_source(session: Session, source_id: int, raw_payload: Any = None) -> di
                     else None
                 ),
             )
-        screening = screened_titles.get(candidate.title)
         result = cached_result
         if result is not None and _is_hard_reject(result):
             if existing_job is not None and _should_auto_prune(existing_job):
@@ -135,27 +173,27 @@ def sync_source(session: Session, source_id: int, raw_payload: Any = None) -> di
             continue
 
         job, was_created = ingest_candidate(session, account, source, candidate)
+        touched_job_ids.append(job.id)
         if cached_result is None:
-            if screening is None:
-                raise ValueError(f"Missing title screening result for candidate: {candidate.title}")
-            if screening.decision == "reject":
-                result = title_screen_reject_result(candidate.title, screening)
+            if not profile or not profile.prompt.strip():
+                job.relevance_decision = "match"
+                job.relevance_source = "system_fallback"
+                job.relevance_score = 1.0
+                job.relevance_summary = "No role profile configured, so the job stays visible by default."
             else:
-                result = queued_relevance_result(
-                    candidate.title,
-                    screening,
-                    summary="Title passed screening and is queued for deeper AI relevance review.",
-                    failure_cause="queued_for_async_relevance",
+                for task in list(job.relevance_tasks):
+                    delete_relevance_task(session, task)
+                mark_job_pending(job, phase="title_screening")
+                upsert_relevance_task(
+                    session,
+                    account_id=account.id,
+                    job_id=job.id,
+                    phase="title_screening",
+                    reset_attempts=True,
                 )
-                queued_job_ids.append(job.id)
-            apply_relevance_result(
-                session,
-                account_id=account.id,
-                job=job,
-                result=result,
-                profile=profile,
-            )
         else:
+            for task in list(job.relevance_tasks):
+                delete_relevance_task(session, task)
             job.relevance_decision = cached_result.decision
             job.relevance_source = cached_result.source
             job.relevance_score = cached_result.score
@@ -166,9 +204,38 @@ def sync_source(session: Session, source_id: int, raw_payload: Any = None) -> di
             updated += 1
 
     session.commit()
-    if queued_job_ids:
-        evaluate_job_batch_now(session, account_id=account.id, job_ids=queued_job_ids)
-    return {"processed": processed, "created": created, "updated": updated}
+
+    if profile and profile.prompt.strip():
+        _requeue_system_fallback_reviews(session, account_id=account.id)
+        session.commit()
+        drain_relevance_tasks_now(
+            session,
+            account_id=account.id,
+            title_batch_limit=settings.inline_title_screening_batch_limit,
+            full_batch_limit=0,
+        )
+
+    pending_title_screening = session.scalar(
+        select(func.count(JobRelevanceTask.id)).where(
+            JobRelevanceTask.account_id == account.id,
+            JobRelevanceTask.job_id.in_(touched_job_ids if touched_job_ids else [-1]),
+            JobRelevanceTask.phase == "title_screening",
+        )
+    ) or 0
+    pending_full_relevance = session.scalar(
+        select(func.count(JobRelevanceTask.id)).where(
+            JobRelevanceTask.account_id == account.id,
+            JobRelevanceTask.job_id.in_(touched_job_ids if touched_job_ids else [-1]),
+            JobRelevanceTask.phase == "full_relevance",
+        )
+    ) or 0
+    return {
+        "processed": processed,
+        "created": created,
+        "updated": updated,
+        "pending_title_screening": pending_title_screening,
+        "pending_full_relevance": pending_full_relevance,
+    }
 
 
 def sync_all_sources_now() -> list[dict[str, int]]:
@@ -178,13 +245,60 @@ def sync_all_sources_now() -> list[dict[str, int]]:
         return [sync_source(session, source_id) for source_id in source_ids]
 
 
+def enqueue_due_source_syncs_now(session: Session) -> int:
+    due_source_ids = select_due_source_ids(session)
+    for source_id in due_source_ids:
+        sync_source_task.delay(source_id)
+    return len(due_source_ids)
+
+
 @celery_app.task(name="app.tasks.discovery.sync_source")
 def sync_source_task(source_id: int) -> dict[str, int]:
     session_factory = get_session_factory()
     with session_factory() as session:
-        return sync_source(session, source_id)
+        source = session.get(JobSource, source_id)
+        if not source or not source.active:
+            return {
+                "processed": 0,
+                "created": 0,
+                "updated": 0,
+                "pending_title_screening": 0,
+                "pending_full_relevance": 0,
+            }
+
+        if not acquire_source_sync_lease(session, source_id=source_id):
+            session.rollback()
+            return {
+                "processed": 0,
+                "created": 0,
+                "updated": 0,
+                "pending_title_screening": 0,
+                "pending_full_relevance": 0,
+            }
+        session.commit()
+
+        try:
+            summary = sync_source(session, source_id)
+            session.refresh(source)
+            mark_source_synced(source)
+            session.commit()
+        except Exception:
+            release_source_sync_lease(session, source_id=source_id)
+            session.commit()
+            raise
+
+        if summary["pending_title_screening"] or summary["pending_full_relevance"]:
+            drain_relevance_tasks_for_account(source.account_id)
+        return summary
 
 
 @celery_app.task(name="app.tasks.discovery.sync_all_sources")
 def sync_all_sources() -> list[dict[str, int]]:
     return sync_all_sources_now()
+
+
+@celery_app.task(name="app.tasks.discovery.enqueue_due_source_syncs")
+def enqueue_due_source_syncs() -> int:
+    session_factory = get_session_factory()
+    with session_factory() as session:
+        return enqueue_due_source_syncs_now(session)

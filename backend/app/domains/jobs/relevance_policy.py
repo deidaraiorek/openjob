@@ -89,11 +89,7 @@ def build_role_context_for_screening(role_prompt: str | None, hints: dict[str, s
         level_desc = "mid-level or general individual-contributor level."
 
     return (
-        f"The user is targeting roles in the '{normalized}' discipline at {level_desc} "
-        "Pass any title that represents work in the same discipline at a compatible level, "
-        "regardless of exact wording, specialization, platform, or technology modifiers. "
-        "Reject only titles that clearly name a different engineering discipline (e.g., hardware, data science, "
-        "product management) — same-discipline specializations are not a different family."
+        f"The user is targeting: '{normalized}' at {level_desc}"
     )
 
 

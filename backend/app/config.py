@@ -25,17 +25,28 @@ class Settings(BaseSettings):
     secure_cookies: bool = False
     playwright_profile_dir: str = "/tmp/openjob-playwright"
     playwright_artifact_dir: str = "/tmp/openjob-playwright-artifacts"
+    answer_file_storage_dir: str = "/tmp/openjob-answer-files"
     groq_api_key: str | None = None
     groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
     groq_title_screening_model: str | None = "meta-llama/llama-4-scout-17b-16e-instruct"
     groq_job_relevance_model: str | None = "meta-llama/llama-4-scout-17b-16e-instruct"
     groq_base_url: str = "https://api.groq.com/openai/v1"
-    relevance_retry_attempts: int = 2
-    relevance_retry_base_delay_seconds: float = 0.5
-    sync_full_relevance_batch_size: int = 5
+    relevance_retry_attempts: int = 3
+    relevance_retry_base_delay_seconds: float = 2.0
+    title_screening_batch_size: int = 50
+    title_screening_batch_delay_seconds: float = 1
+    full_relevance_batch_size: int = 5
+    full_relevance_batch_delay_seconds: float = 0.75
+    inline_title_screening_batch_limit: int = 2
+    background_relevance_batch_limit: int = 3
+    relevance_task_lease_seconds: int = 60
+    relevance_invalid_response_review_threshold: int = 3
     openai_api_key: str | None = None
     openai_role_profile_model: str = "gpt-5-mini"
     openai_job_relevance_model: str = "gpt-5-mini"
+    source_default_sync_interval_hours: int = 6
+    source_sync_poll_interval_seconds: int = 300
+    source_sync_lease_seconds: int = 900
 
     @property
     def session_cookie_name(self) -> str:

@@ -20,9 +20,9 @@ celery_app = Celery(
 celery_app.conf.update(
     timezone="UTC",
     beat_schedule={
-        "daily-source-sync": {
-            "task": "app.tasks.discovery.sync_all_sources",
-            "schedule": 60 * 60 * 24,
+        "enqueue-due-source-syncs": {
+            "task": "app.tasks.discovery.enqueue_due_source_syncs",
+            "schedule": settings.source_sync_poll_interval_seconds,
         },
     },
 )

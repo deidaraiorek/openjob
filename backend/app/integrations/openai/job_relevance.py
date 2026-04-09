@@ -485,11 +485,12 @@ def _classify_with_ai(
                     "These jobs have already gone through title screening, so do not treat harmless wording differences or specializations as ambiguity by default. "
                     "Treat a passed title as strong evidence that the role family is already in scope unless the richer context clearly contradicts it. "
                     "Prefer 'match' when the role family and likely level fit the user's profile and there is no strong contradictory evidence in the available context. "
-                    "Treat common wording variants, near-equivalents, and alternate phrasings within the same role family as compatible by default when they imply the same kind of work. "
+                    "Treat alternate job title wordings that imply the same kind of work as equivalent — minor label differences are not a reason for uncertainty. "
                     "Treat neighboring early-career indicators and adjacent entry-level signals as generally compatible unless the context clearly shows a different seniority band. "
                     "Do not assume that adjacent early-career wording, associate labels, or level-1 style indicators are too senior unless the richer context clearly shows a materially different level. "
                     "Do not treat specialization, team, platform, domain, technology, or focus-area modifiers as evidence against fit by default. "
                     "Do not treat same-industry adjacency or broad technical similarity as enough for a match when the underlying discipline is different. "
+                    "A slash in a title (e.g. Engineer/Tester) does not automatically create uncertainty — only use review if the secondary role is a genuinely different discipline that dominates the role. "
                     "Use 'review' only when the available information creates real uncertainty after considering the already-passed title and the richer context. "
                     "Write a concise summary that explains the reasoning and does not simply restate the title or company name. "
                     "Valid decision values are match, review, reject."
@@ -523,6 +524,7 @@ def _classify_with_ai(
                             "The title already passed AI title screening, so focus on whether the richer context disqualifies it rather than re-litigating harmless title differences.",
                             "Do not use review just because the title wording is not an exact match to the user's prompt.",
                             "Do not use review just because the title includes specialization, team, domain, technology, or focus modifiers.",
+                            "Alternate title wordings that imply the same kind of work are not a reason for uncertainty — treat them as equivalent.",
                             "If the role is still clearly within the intended family and likely level, prefer match.",
                             "Do not use review just because the title uses adjacent entry-level wording or level-1 style labels.",
                             "Do not infer that a role is too senior unless the richer context provides clear evidence of that.",
@@ -603,11 +605,12 @@ def _classify_batch_with_ai(
                     "These jobs have already gone through title screening, so do not treat harmless wording differences or specializations as ambiguity by default. "
                     "Treat a passed title as strong evidence that the role family is already in scope unless the richer context clearly contradicts it. "
                     "Prefer 'match' when the role family and likely level fit the user's profile and there is no strong contradictory evidence in the available context. "
-                    "Treat common wording variants, near-equivalents, and alternate phrasings within the same role family as compatible by default when they imply the same kind of work. "
+                    "Treat alternate job title wordings that imply the same kind of work as equivalent — minor label differences are not a reason for uncertainty. "
                     "Treat neighboring early-career indicators and adjacent entry-level signals as generally compatible unless the context clearly shows a different seniority band. "
                     "Do not assume that adjacent early-career wording, associate labels, or level-1 style indicators are too senior unless the richer context clearly shows a materially different level. "
                     "Do not treat specialization, team, platform, domain, technology, or focus-area modifiers as evidence against fit by default. "
                     "Do not treat same-industry adjacency or broad technical similarity as enough for a match when the underlying discipline is different. "
+                    "A slash in a title (e.g. Engineer/Tester) does not automatically create uncertainty — only use review if the secondary role is a genuinely different discipline that dominates the role. "
                     "Use 'review' only when the available information creates real uncertainty after considering the already-passed title and the richer context. "
                     "Write concise summaries that explain the reasoning and do not simply restate the title or company name. "
                     "Return JSON with a single key 'results'. "
@@ -647,6 +650,7 @@ def _classify_batch_with_ai(
                             "Only these jobs already passed title screening, so focus on whether the richer context disqualifies them rather than re-litigating harmless title differences.",
                             "Do not use review just because the title wording is not an exact match to the user's prompt.",
                             "Do not use review just because the title includes specialization, team, domain, technology, or focus modifiers.",
+                            "Alternate title wordings that imply the same kind of work are not a reason for uncertainty — treat them as equivalent.",
                             "If the role is still clearly within the intended family and likely level, prefer match.",
                             "Do not use review just because the title uses adjacent entry-level wording or level-1 style labels.",
                             "Do not infer that a role is too senior unless the richer context provides clear evidence of that.",

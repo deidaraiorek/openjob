@@ -1,3 +1,5 @@
+import threading
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect
@@ -14,6 +16,7 @@ from app.domains.role_profiles.routes import router as role_profile_router
 from app.domains.sources.routes import router as sources_router
 from app.db.base import Base
 from app.db.session import get_engine
+from app.tasks.job_relevance import drain_all_relevance_tasks
 
 
 def ensure_database_ready() -> None:
@@ -21,7 +24,15 @@ def ensure_database_ready() -> None:
     engine = get_engine(settings.database_url)
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
-    required_tables = {"accounts", "job_sources", "jobs"}
+    required_tables = {
+        "accounts",
+        "job_sources",
+        "jobs",
+        "job_sightings",
+        "apply_targets",
+        "job_relevance_evaluations",
+        "job_relevance_tasks",
+    }
 
     if required_tables.issubset(existing_tables):
         return
@@ -57,6 +68,11 @@ def create_app() -> FastAPI:
     app.include_router(questions_router, prefix="/api")
     app.include_router(jobs_router, prefix="/api")
     app.include_router(applications_router, prefix="/api")
+
+    @app.on_event("startup")
+    def _resume_pending_relevance() -> None:
+        threading.Thread(target=drain_all_relevance_tasks, daemon=True).start()
+
     return app
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -45,14 +46,6 @@ TITLE_SCREENING_SCHEMA = {
                             "type": "string",
                             "enum": ["compatible", "incompatible", "uncertain"],
                         },
-                        "modifier_impact": {
-                            "type": "string",
-                            "enum": ["none", "specialization_only", "material_scope_change", "uncertain"],
-                        },
-                        "contradiction_strength": {
-                            "type": "string",
-                            "enum": ["none", "weak", "moderate", "strong"],
-                        },
                     },
                     "required": [
                         "title_index",
@@ -61,8 +54,6 @@ TITLE_SCREENING_SCHEMA = {
                         "decision_rationale_type",
                         "role_family_alignment",
                         "seniority_alignment",
-                        "modifier_impact",
-                        "contradiction_strength",
                     ],
                 },
             }
@@ -98,14 +89,6 @@ TITLE_SCREENING_REPAIR_SCHEMA = {
                 "type": "string",
                 "enum": ["compatible", "incompatible", "uncertain"],
             },
-            "modifier_impact": {
-                "type": "string",
-                "enum": ["none", "specialization_only", "material_scope_change", "uncertain"],
-            },
-            "contradiction_strength": {
-                "type": "string",
-                "enum": ["none", "weak", "moderate", "strong"],
-            },
         },
         "required": [
             "decision",
@@ -113,8 +96,6 @@ TITLE_SCREENING_REPAIR_SCHEMA = {
             "decision_rationale_type",
             "role_family_alignment",
             "seniority_alignment",
-            "modifier_impact",
-            "contradiction_strength",
         ],
     },
 }
@@ -265,45 +246,31 @@ def _title_screening_supported(payload: dict[str, Any]) -> bool:
 def _title_screening_safe_reject(payload: dict[str, Any]) -> bool:
     family = _normalize_role_family_alignment(payload.get("role_family_alignment"))
     seniority = _normalize_seniority_alignment(payload.get("seniority_alignment"))
-    modifier = _normalize_modifier_impact(payload.get("modifier_impact"))
-    contradiction = _normalize_contradiction_strength(payload.get("contradiction_strength"))
     rationale = _normalize_rationale_type(payload.get("decision_rationale_type"))
 
-    if None in {family, seniority, modifier, contradiction, rationale}:
+    if None in {family, seniority, rationale}:
         return False
-    if (
-        family == "different_family"
-        and rationale == "clear_family_mismatch"
-        and modifier == "material_scope_change"
-        and contradiction in {"moderate", "strong"}
-    ):
+    if family == "different_family" and rationale == "clear_family_mismatch":
         return True
-    return (
-        seniority == "incompatible"
-        and rationale == "clear_seniority_mismatch"
-        and contradiction == "strong"
-    )
+    return seniority == "incompatible" and rationale == "clear_seniority_mismatch"
 
 
 def _title_screening_inconsistent(*, decision: str, payload: dict[str, Any]) -> bool:
     family = _normalize_role_family_alignment(payload.get("role_family_alignment"))
     seniority = _normalize_seniority_alignment(payload.get("seniority_alignment"))
-    modifier = _normalize_modifier_impact(payload.get("modifier_impact"))
-    contradiction = _normalize_contradiction_strength(payload.get("contradiction_strength"))
     rationale = _normalize_rationale_type(payload.get("decision_rationale_type"))
 
-    if None in {family, seniority, modifier, contradiction, rationale}:
+    if None in {family, seniority, rationale}:
         return True
-    if decision == "pass" and family == "different_family" and contradiction in {"moderate", "strong"}:
+    if decision == "pass" and family == "different_family" and rationale == "clear_family_mismatch":
         return True
-    if decision == "pass" and seniority == "incompatible" and contradiction in {"moderate", "strong"}:
+    if decision == "pass" and seniority == "incompatible" and rationale == "clear_seniority_mismatch":
         return True
     return (
         decision == "reject"
         and family == "same_family"
         and seniority == "compatible"
-        and modifier in {"none", "specialization_only"}
-        and contradiction in {"none", "weak"}
+        and rationale in {"family_match", "specialization_only", "adjacent_level_variant"}
     )
 
 
@@ -390,7 +357,16 @@ def _repair_item_with_ai(
     payload = json.loads(_extract_completion_text(response))
     decision = _normalize_screening_decision(payload.get("decision"))
     if _title_screening_inconsistent(decision=decision, payload=payload):
-        raise ValueError("repair_response_inconsistent")
+        return JobTitleScreeningItem(
+            title=title,
+            decision="pass",
+            summary="Title screening repair produced an inconsistent result, so the title passes to deeper review.",
+            decision_rationale_type="ambiguous_but_passed",
+            source="ai",
+            model_name=model,
+            failure_cause=None,
+            payload=_structured_fields_payload(payload),
+        )
     return JobTitleScreeningItem(
         title=title,
         decision=decision,
@@ -403,6 +379,30 @@ def _repair_item_with_ai(
     )
 
 
+def _parse_ratelimit_reset_seconds(headers: Any) -> float | None:
+    remaining = headers.get("x-ratelimit-remaining-tokens")
+    reset_str = headers.get("x-ratelimit-reset-tokens")
+    if remaining is None or reset_str is None:
+        return None
+    try:
+        remaining_tokens = int(remaining)
+    except (ValueError, TypeError):
+        return None
+    if remaining_tokens > 5000:
+        return None
+    reset_str = str(reset_str).strip().lower()
+    total_seconds = 0.0
+    for value, unit in re.findall(r"(\d+(?:\.\d+)?)(ms|s|m)", reset_str):
+        v = float(value)
+        if unit == "ms":
+            total_seconds += v / 1000
+        elif unit == "s":
+            total_seconds += v
+        elif unit == "m":
+            total_seconds += v * 60
+    return max(0.0, total_seconds) if total_seconds > 0 else None
+
+
 def _classify_batch_with_ai(
     client: OpenAI,
     model: str,
@@ -411,34 +411,23 @@ def _classify_batch_with_ai(
     titles: list[str],
     decision_policy: dict[str, str | bool],
     derived_profile_hints: dict[str, str | bool],
-) -> JobTitleScreeningResult:
+) -> tuple[JobTitleScreeningResult, Any]:
     role_context = build_role_context_for_screening(role_prompt, derived_profile_hints)
     role_context_prefix = (role_context + " ") if role_context else ""
-    response = client.chat.completions.create(
+    raw = client.chat.completions.with_raw_response.create(
         model=model,
         response_format=_json_schema_response_format(TITLE_SCREENING_SCHEMA),
         messages=[
             {
                 "role": "system",
                 "content": (
-                    f"{role_context_prefix}"
-                    "You are screening job titles for a personal job assistant. "
-                    "Given a user's desired role and a batch of job titles, classify each title as pass or reject. "
-                    "This is a high-recall safety gate. Use reject only when title alone safely excludes the job from deeper review. "
-                    "Use pass whenever the title is plausibly in scope or still needs richer context to decide. "
-                    "When in doubt, choose pass so the job can continue to deeper review. "
-                    "Bias toward pass when the core role family aligns with the user's intent, even if the title wording is not an exact match. "
-                    "Treat common wording variants, near-equivalents, and alternate phrasings within the same role family as in scope by default when they imply the same kind of work. "
-                    "Treat specialization, team, platform, domain, technology, or focus-area modifiers as compatible by default unless they clearly imply a materially different function. "
-                    "Titles that narrow the work by platform, application layer, delivery surface, or implementation specialty should remain same_family when the underlying discipline is the same. "
-                    "Treat neighboring early-career indicators and adjacent entry-level signals as compatible by default unless the title clearly implies a materially different seniority band. "
-                    "Do not treat same-industry adjacency or same broad engineering context as the same role family by default. Different disciplines remain different families unless the title clearly names a materially different kind of work. "
-                    "Use reject only when the title is clearly out of scope or clearly too senior. "
-                    "Write a concise summary that explains the classification reason in plain language. Do not simply repeat the title or company name. "
-                    "Return JSON with a single key 'results' containing objects with keys title_index, decision, summary, decision_rationale_type, role_family_alignment, seniority_alignment, modifier_impact, and contradiction_strength. "
-                    "Your structured fields must support your final decision. "
-                    "If the role family is the same or uncertain, seniority is compatible or uncertain, and differences are only specialization or weak contradictions, the decision should usually be pass rather than reject. "
-                    "Do not omit any title_index. Copy the exact title_index integer from the input."
+                    f"{role_context_prefix} "
+                    "High-recall title gate: pass unless the title alone is clear evidence the job is out of scope. "
+                    "Pass: same role family (including specializations, platforms, tech modifiers), adjacent level variants, or anything ambiguous. "
+                    "Reject: clearly different discipline, or clearly too senior — title must make this unambiguous without job description context. "
+                    "Same industry or engineering org is not the same discipline. Different core function is a different family. "
+                    "Structured fields must be consistent with your decision. "
+                    "Do not omit any title_index."
                 ),
             },
             {
@@ -446,8 +435,6 @@ def _classify_batch_with_ai(
                 "content": json.dumps(
                     {
                         "role_profile_prompt": role_prompt,
-                        "derived_profile_hints": derived_profile_hints,
-                        "decision_policy": decision_policy,
                         "titles": [
                             {"title_index": index, "title": title}
                             for index, title in enumerate(titles)
@@ -457,6 +444,7 @@ def _classify_batch_with_ai(
             },
         ],
     )
+    response = raw.parse()
 
     payload = json.loads(_extract_completion_text(response))
     raw_items = payload.get("results", [])
@@ -546,7 +534,7 @@ def _classify_batch_with_ai(
         model_name=model,
         failure_cause=None,
         payload=payload,
-    )
+    ), raw.headers
 
 
 def classify_job_titles(
@@ -614,9 +602,10 @@ def classify_job_titles(
 
     for batch in batches:
         batch_result: JobTitleScreeningResult | None = None
+        ratelimit_headers: Any = None
         for attempt in range(retry_attempts):
             try:
-                batch_result = _classify_batch_with_ai(
+                batch_result, ratelimit_headers = _classify_batch_with_ai(
                     resolved_client,
                     configured_model,
                     role_prompt=role_prompt,
@@ -688,6 +677,11 @@ def classify_job_titles(
             failure_causes.append(batch_result.failure_cause)
         aggregated_items.extend(batch_result.items)
         aggregated_payloads.append(batch_result.payload)
+
+        if ratelimit_headers is not None and len(aggregated_items) < len(normalized_titles):
+            header_sleep = _parse_ratelimit_reset_seconds(ratelimit_headers)
+            if header_sleep is not None:
+                time.sleep(header_sleep)
 
     return JobTitleScreeningResult(
         items=aggregated_items,

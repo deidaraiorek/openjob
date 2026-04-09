@@ -178,6 +178,10 @@ def _process_title_screening_tasks(
     if not tasks:
         return 0
 
+    tasks = [task for task in tasks if task.job is not None]
+    if not tasks:
+        return 0
+
     processed = 0
     for index in range(0, len(tasks), settings.title_screening_batch_size):
         chunk = tasks[index: index + settings.title_screening_batch_size]
@@ -231,6 +235,9 @@ def _process_title_screening_tasks(
             )
             delete_relevance_task(session, task)
         session.commit()
+        batch_delay = getattr(settings, "title_screening_batch_delay_seconds", 0.0)
+        if batch_delay and index + settings.title_screening_batch_size < len(tasks):
+            time.sleep(max(0.0, batch_delay))
 
     return processed
 
@@ -245,6 +252,7 @@ def _process_full_relevance_tasks(
     profile = session.scalar(select(RoleProfile).where(RoleProfile.account_id == account_id))
     task_limit = max(0, batch_limit) * max(1, settings.full_relevance_batch_size)
     tasks = _lease_ready_tasks(session, account_id=account_id, phase="full_relevance", limit=task_limit)
+    tasks = [task for task in tasks if task.job is not None]
     if not tasks:
         return 0
 
@@ -358,7 +366,8 @@ def drain_relevance_tasks_for_account(account_id: int) -> int:
             break
         if next_available_at is None:
             break
-        wait_seconds = max(0.1, min(5.0, (next_available_at - datetime.now(UTC)).total_seconds()))
+        aware_next = next_available_at.replace(tzinfo=UTC) if next_available_at.tzinfo is None else next_available_at
+        wait_seconds = max(0.1, min(5.0, (aware_next - datetime.now(UTC)).total_seconds()))
         time.sleep(wait_seconds)
     return total_processed
 

@@ -11,6 +11,10 @@ export type Source = {
   base_url: string | null;
   settings: Record<string, unknown>;
   active: boolean;
+  auto_sync_enabled: boolean;
+  sync_interval_hours: number;
+  last_synced_at: string | null;
+  next_sync_at: string | null;
 };
 
 export type SourceSyncResult = {
@@ -20,6 +24,10 @@ export type SourceSyncResult = {
   processed: number;
   created: number;
   updated: number;
+  pending_title_screening: number;
+  pending_full_relevance: number;
+  last_synced_at: string | null;
+  next_sync_at: string | null;
 };
 
 export type SourceCreatePayload = {
@@ -29,9 +37,13 @@ export type SourceCreatePayload = {
   base_url: string | null;
   settings: Record<string, unknown>;
   active: boolean;
+  auto_sync_enabled: boolean;
+  sync_interval_hours: number | null;
 };
 
 export type SourceUpdatePayload = SourceCreatePayload;
+
+type SourceApiPayload = Partial<Source> & Pick<Source, "id" | "source_key" | "source_type" | "name">;
 
 export type RoleProfile = {
   id: number;
@@ -52,6 +64,12 @@ export type AnswerEntry = {
   label: string;
   answer_text: string | null;
   answer_payload: Record<string, unknown>;
+};
+
+export type AnswerFileUploadPayload = {
+  question_template_id: number | null;
+  label: string;
+  file: File;
 };
 
 export type AnswerCreatePayload = {
@@ -91,7 +109,12 @@ export type JobListItem = {
   relevance_score: number | null;
   relevance_summary: string | null;
   relevance_failure_cause: string | null;
-  relevance_decision_phase: string | null;
+  relevance_decision_phase?: string | null;
+  relevance_decision_rationale_type?: string | null;
+  pending_relevance_phase?: string | null;
+  pending_relevance_attempt_count?: number | null;
+  pending_relevance_failure_cause?: string | null;
+  pending_relevance_next_retry_at?: string | null;
   preferred_apply_target_type: string | null;
   sighting_count: number;
   open_question_task_count: number;
@@ -110,7 +133,12 @@ export type JobDetail = {
   relevance_score: number | null;
   relevance_summary: string | null;
   relevance_failure_cause: string | null;
-  relevance_decision_phase: string | null;
+  relevance_decision_phase?: string | null;
+  relevance_decision_rationale_type?: string | null;
+  pending_relevance_phase?: string | null;
+  pending_relevance_attempt_count?: number | null;
+  pending_relevance_failure_cause?: string | null;
+  pending_relevance_next_retry_at?: string | null;
   sightings: {
     id: number;
     source_id: number | null;
@@ -146,7 +174,10 @@ export type JobDetail = {
     concerns: string[];
     model_name: string | null;
     failure_cause: string | null;
-    decision_phase: string | null;
+    decision_phase?: string | null;
+    decision_rationale_type?: string | null;
+    decision_policy_snapshot?: Record<string, unknown> | null;
+    derived_profile_hints?: Record<string, unknown> | null;
   }[];
 };
 
@@ -162,7 +193,12 @@ export type JobRelevanceUpdateResult = {
   relevance_score: number | null;
   relevance_summary: string | null;
   relevance_failure_cause: string | null;
-  relevance_decision_phase: string | null;
+  relevance_decision_phase?: string | null;
+  relevance_decision_rationale_type?: string | null;
+  pending_relevance_phase?: string | null;
+  pending_relevance_attempt_count?: number | null;
+  pending_relevance_failure_cause?: string | null;
+  pending_relevance_next_retry_at?: string | null;
 };
 
 export type ActionNeededItem = {
@@ -206,6 +242,7 @@ export interface AppApi extends AuthApi {
   saveRoleProfile(payload: RoleProfilePayload): Promise<RoleProfile>;
   listAnswers(): Promise<AnswerEntry[]>;
   createAnswer(payload: AnswerCreatePayload): Promise<AnswerEntry>;
+  uploadAnswerFile(payload: AnswerFileUploadPayload): Promise<AnswerEntry>;
   updateAnswer(answerId: number, payload: AnswerUpdatePayload): Promise<AnswerEntry>;
   listQuestionTasks(): Promise<QuestionTask[]>;
   resolveQuestionTask(taskId: number, payload: ResolveQuestionTaskPayload): Promise<QuestionTask>;
@@ -260,6 +297,44 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+async function requestForm<T>(path: string, body: FormData, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${baseUrl}${path}`, {
+    credentials: "include",
+    ...init,
+    headers: init?.headers,
+    body,
+  });
+
+  if (!response.ok) {
+    throw await buildError(response);
+  }
+
+  if (response.status === 204) {
+    return undefined as T;
+  }
+
+  return (await response.json()) as T;
+}
+
+function normalizeSource(source: SourceApiPayload): Source {
+  return {
+    id: source.id,
+    source_key: source.source_key,
+    source_type: source.source_type,
+    name: source.name,
+    base_url: source.base_url ?? null,
+    settings: source.settings ?? {},
+    active: source.active ?? true,
+    auto_sync_enabled: source.auto_sync_enabled ?? true,
+    sync_interval_hours:
+      typeof source.sync_interval_hours === "number" && Number.isFinite(source.sync_interval_hours)
+        ? Math.max(1, source.sync_interval_hours)
+        : 6,
+    last_synced_at: source.last_synced_at ?? null,
+    next_sync_at: source.next_sync_at ?? null,
+  };
+}
+
 export const apiClient: AppApi = {
   getSession() {
     return request<SessionResponse>("/api/auth/session");
@@ -274,19 +349,19 @@ export const apiClient: AppApi = {
     return request<void>("/api/auth/logout", { method: "POST" });
   },
   listSources() {
-    return request<Source[]>("/api/sources");
+    return request<SourceApiPayload[]>("/api/sources").then((sources) => sources.map(normalizeSource));
   },
   createSource(payload) {
-    return request<Source>("/api/sources", {
+    return request<SourceApiPayload>("/api/sources", {
       method: "POST",
       body: JSON.stringify(payload),
-    });
+    }).then(normalizeSource);
   },
   updateSource(sourceId, payload) {
-    return request<Source>(`/api/sources/${sourceId}`, {
+    return request<SourceApiPayload>(`/api/sources/${sourceId}`, {
       method: "PUT",
       body: JSON.stringify(payload),
-    });
+    }).then(normalizeSource);
   },
   deleteSource(sourceId) {
     return request<void>(`/api/sources/${sourceId}`, {
@@ -314,6 +389,17 @@ export const apiClient: AppApi = {
     return request<AnswerEntry>("/api/answers", {
       method: "POST",
       body: JSON.stringify(payload),
+    });
+  },
+  uploadAnswerFile(payload) {
+    const formData = new FormData();
+    if (payload.question_template_id !== null) {
+      formData.append("question_template_id", String(payload.question_template_id));
+    }
+    formData.append("label", payload.label);
+    formData.append("upload", payload.file);
+    return requestForm<AnswerEntry>("/api/answers/upload", formData, {
+      method: "POST",
     });
   },
   updateAnswer(answerId, payload) {

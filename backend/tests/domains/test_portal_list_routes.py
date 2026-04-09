@@ -101,6 +101,17 @@ def test_portal_job_list_hides_rejected_jobs_from_active_view(auth_client, db_se
                 relevance_source="ai",
                 relevance_summary="Rejected as a hardware role.",
             ),
+            Job(
+                account_id=account.id,
+                canonical_key="pending-job",
+                company_name="SlowAI",
+                title="Junior Software Developer",
+                location="Remote",
+                status="discovered",
+                relevance_decision="pending",
+                relevance_source="pending_title_screening",
+                relevance_summary="Waiting for AI title screening.",
+            ),
         ]
     )
     db_session.commit()

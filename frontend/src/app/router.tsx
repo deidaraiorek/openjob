@@ -1,4 +1,5 @@
 import {
+  Navigate,
   createBrowserRouter,
   createMemoryRouter,
   type RouteObject,
@@ -8,7 +9,6 @@ import { AppLayout } from "./layout";
 import { apiClient, type AppApi } from "../lib/api";
 import { DashboardRoute } from "../routes/dashboard";
 import { ActionNeededRoute } from "../routes/action-needed";
-import { AnswersRoute } from "../routes/answers";
 import { JobDetailRoute } from "../routes/job-detail";
 import { JobsRoute } from "../routes/jobs";
 import { LoginRoute } from "../routes/login";
@@ -44,7 +44,7 @@ export function buildRoutes(api: AppApi = apiClient): RouteObject[] {
         },
         {
           path: "answers",
-          element: <AnswersRoute />,
+          element: <Navigate to="/role-profile?tab=answers" replace />,
         },
         {
           path: "questions",

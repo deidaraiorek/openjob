@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.domains.accounts.dependencies import get_current_account
 from app.domains.accounts.models import Account
-from app.domains.jobs.models import ApplyTarget, Job, JobRelevanceEvaluation, JobSighting
+from app.domains.jobs.models import ApplyTarget, Job, JobRelevanceEvaluation, JobRelevanceTask, JobSighting
 from app.domains.jobs.relevance import apply_relevance_result
 from app.domains.questions.models import QuestionTask
 from app.domains.applications.models import ApplicationEvent, ApplicationRun
@@ -64,6 +64,9 @@ class JobRelevanceEvaluationResponse(BaseModel):
     model_name: str | None
     failure_cause: str | None
     decision_phase: str | None
+    decision_rationale_type: str | None
+    decision_policy_snapshot: dict | None = None
+    derived_profile_hints: dict | None = None
 
 
 class JobRelevanceUpdateRequest(BaseModel):
@@ -79,6 +82,11 @@ class JobRelevanceUpdateResponse(BaseModel):
     relevance_summary: str | None
     relevance_failure_cause: str | None
     relevance_decision_phase: str | None
+    relevance_decision_rationale_type: str | None
+    pending_relevance_phase: str | None = None
+    pending_relevance_attempt_count: int | None = None
+    pending_relevance_failure_cause: str | None = None
+    pending_relevance_next_retry_at: str | None = None
 
 
 class JobRescoreResponse(BaseModel):
@@ -89,6 +97,11 @@ class JobRescoreResponse(BaseModel):
     relevance_summary: str | None
     relevance_failure_cause: str | None
     relevance_decision_phase: str | None
+    relevance_decision_rationale_type: str | None
+    pending_relevance_phase: str | None = None
+    pending_relevance_attempt_count: int | None = None
+    pending_relevance_failure_cause: str | None = None
+    pending_relevance_next_retry_at: str | None = None
 
 
 class JobDetailResponse(BaseModel):
@@ -104,6 +117,11 @@ class JobDetailResponse(BaseModel):
     relevance_summary: str | None
     relevance_failure_cause: str | None
     relevance_decision_phase: str | None
+    relevance_decision_rationale_type: str | None
+    pending_relevance_phase: str | None = None
+    pending_relevance_attempt_count: int | None = None
+    pending_relevance_failure_cause: str | None = None
+    pending_relevance_next_retry_at: str | None = None
     sightings: list[JobSightingResponse]
     preferred_apply_target: ApplyTargetResponse | None
     question_tasks: list[QuestionTaskSummary]
@@ -124,6 +142,11 @@ class JobListItemResponse(BaseModel):
     relevance_summary: str | None
     relevance_failure_cause: str | None
     relevance_decision_phase: str | None
+    relevance_decision_rationale_type: str | None
+    pending_relevance_phase: str | None = None
+    pending_relevance_attempt_count: int | None = None
+    pending_relevance_failure_cause: str | None = None
+    pending_relevance_next_retry_at: str | None = None
     preferred_apply_target_type: str | None
     sighting_count: int
     open_question_task_count: int
@@ -180,6 +203,9 @@ def serialize_relevance_evaluation(
         model_name=evaluation.model_name,
         failure_cause=evaluation.payload.get("failure_cause"),
         decision_phase=evaluation.payload.get("decision_phase"),
+        decision_rationale_type=evaluation.payload.get("decision_rationale_type"),
+        decision_policy_snapshot=evaluation.payload.get("decision_policy_snapshot"),
+        derived_profile_hints=evaluation.payload.get("derived_profile_hints"),
     )
 
 
@@ -201,6 +227,12 @@ def effective_relevance_decision(job: Job) -> str:
     if job.status == "filtered_out":
         return "reject"
     return "match"
+
+
+def effective_pending_relevance_task(job: Job) -> JobRelevanceTask | None:
+    if not job.relevance_tasks:
+        return None
+    return sorted(job.relevance_tasks, key=lambda item: (item.available_at, item.id))[0]
 
 
 def effective_relevance_source(job: Job) -> str | None:
@@ -228,14 +260,26 @@ def effective_relevance_summary(job: Job) -> str | None:
 
 
 def effective_relevance_failure_cause(job: Job) -> str | None:
+    pending_task = effective_pending_relevance_task(job)
+    if effective_relevance_decision(job) == "pending" and pending_task is not None:
+        return pending_task.last_failure_cause
     if job.relevance_evaluations:
         return job.relevance_evaluations[0].payload.get("failure_cause")
     return None
 
 
 def effective_relevance_decision_phase(job: Job) -> str | None:
+    pending_task = effective_pending_relevance_task(job)
+    if effective_relevance_decision(job) == "pending" and pending_task is not None:
+        return pending_task.phase
     if job.relevance_evaluations:
         return job.relevance_evaluations[0].payload.get("decision_phase")
+    return None
+
+
+def effective_relevance_decision_rationale_type(job: Job) -> str | None:
+    if job.relevance_evaluations:
+        return job.relevance_evaluations[0].payload.get("decision_rationale_type")
     return None
 
 
@@ -254,6 +298,7 @@ def list_jobs(
             selectinload(Job.question_tasks),
             selectinload(Job.application_runs),
             selectinload(Job.relevance_evaluations),
+            selectinload(Job.relevance_tasks),
         )
         .order_by(Job.id.desc()),
     ).all()
@@ -263,8 +308,11 @@ def list_jobs(
         effective_decision = effective_relevance_decision(job)
         if relevance == "active" and effective_decision == "reject":
             continue
-        if relevance in {"match", "review", "reject"} and effective_decision != relevance:
+        if relevance == "active" and effective_decision == "pending":
             continue
+        if relevance in {"match", "review", "reject", "pending"} and effective_decision != relevance:
+            continue
+        pending_task = effective_pending_relevance_task(job)
         preferred_target = next(
             (target for target in job.apply_targets if target.is_preferred),
             None,
@@ -284,6 +332,11 @@ def list_jobs(
                 relevance_summary=effective_relevance_summary(job),
                 relevance_failure_cause=effective_relevance_failure_cause(job),
                 relevance_decision_phase=effective_relevance_decision_phase(job),
+                relevance_decision_rationale_type=effective_relevance_decision_rationale_type(job),
+                pending_relevance_phase=pending_task.phase if pending_task else None,
+                pending_relevance_attempt_count=pending_task.attempt_count if pending_task else None,
+                pending_relevance_failure_cause=pending_task.last_failure_cause if pending_task else None,
+                pending_relevance_next_retry_at=pending_task.available_at.isoformat() if pending_task else None,
                 preferred_apply_target_type=preferred_target.target_type if preferred_target else None,
                 sighting_count=len(job.sightings),
                 open_question_task_count=len(
@@ -340,8 +393,11 @@ def update_job_relevance(
         ),
         profile=None,
     )
+    for task in list(job.relevance_tasks):
+        session.delete(task)
     session.commit()
     session.refresh(job)
+    pending_task = effective_pending_relevance_task(job)
     return JobRelevanceUpdateResponse(
         job_id=job.id,
         relevance_decision=effective_relevance_decision(job),
@@ -350,6 +406,11 @@ def update_job_relevance(
         relevance_summary=effective_relevance_summary(job),
         relevance_failure_cause=effective_relevance_failure_cause(job),
         relevance_decision_phase=effective_relevance_decision_phase(job),
+        relevance_decision_rationale_type=effective_relevance_decision_rationale_type(job),
+        pending_relevance_phase=pending_task.phase if pending_task else None,
+        pending_relevance_attempt_count=pending_task.attempt_count if pending_task else None,
+        pending_relevance_failure_cause=pending_task.last_failure_cause if pending_task else None,
+        pending_relevance_next_retry_at=pending_task.available_at.isoformat() if pending_task else None,
     )
 
 
@@ -364,6 +425,7 @@ def rescore_job_route(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
     session.commit()
     session.refresh(job)
+    pending_task = effective_pending_relevance_task(job)
     return JobRescoreResponse(
         job_id=job.id,
         relevance_decision=effective_relevance_decision(job),
@@ -372,6 +434,11 @@ def rescore_job_route(
         relevance_summary=effective_relevance_summary(job),
         relevance_failure_cause=effective_relevance_failure_cause(job),
         relevance_decision_phase=effective_relevance_decision_phase(job),
+        relevance_decision_rationale_type=effective_relevance_decision_rationale_type(job),
+        pending_relevance_phase=pending_task.phase if pending_task else None,
+        pending_relevance_attempt_count=pending_task.attempt_count if pending_task else None,
+        pending_relevance_failure_cause=pending_task.last_failure_cause if pending_task else None,
+        pending_relevance_next_retry_at=pending_task.available_at.isoformat() if pending_task else None,
     )
 
 
@@ -390,6 +457,7 @@ def get_job_detail(
             selectinload(Job.question_tasks),
             selectinload(Job.application_runs).selectinload(ApplicationRun.events),
             selectinload(Job.relevance_evaluations),
+            selectinload(Job.relevance_tasks),
         ),
     )
     if not job:
@@ -399,6 +467,7 @@ def get_job_detail(
         (target for target in job.apply_targets if target.is_preferred),
         None,
     )
+    pending_task = effective_pending_relevance_task(job)
 
     return JobDetailResponse(
         id=job.id,
@@ -413,6 +482,11 @@ def get_job_detail(
         relevance_summary=effective_relevance_summary(job),
         relevance_failure_cause=effective_relevance_failure_cause(job),
         relevance_decision_phase=effective_relevance_decision_phase(job),
+        relevance_decision_rationale_type=effective_relevance_decision_rationale_type(job),
+        pending_relevance_phase=pending_task.phase if pending_task else None,
+        pending_relevance_attempt_count=pending_task.attempt_count if pending_task else None,
+        pending_relevance_failure_cause=pending_task.last_failure_cause if pending_task else None,
+        pending_relevance_next_retry_at=pending_task.available_at.isoformat() if pending_task else None,
         sightings=[serialize_sighting(sighting) for sighting in sorted(job.sightings, key=lambda item: item.id)],
         preferred_apply_target=serialize_apply_target(preferred_target) if preferred_target else None,
         question_tasks=[

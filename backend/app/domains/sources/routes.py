@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from threading import Lock
+from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -11,11 +11,18 @@ from sqlalchemy.orm import Session
 from app.domains.accounts.dependencies import get_current_account
 from app.domains.accounts.models import Account
 from app.domains.sources.models import JobSource
+from app.domains.sources.sync_control import (
+    acquire_source_sync_lease,
+    apply_source_schedule_defaults,
+    mark_source_synced,
+    normalize_sync_interval_hours,
+    release_source_sync_lease,
+)
 from app.db.session import get_db_session
 from app.tasks.discovery import sync_source
+from app.tasks.job_relevance import drain_relevance_tasks_for_account
 
 router = APIRouter(prefix="/sources", tags=["sources"])
-_source_sync_lock = Lock()
 
 
 class SourceCreateRequest(BaseModel):
@@ -25,6 +32,8 @@ class SourceCreateRequest(BaseModel):
     base_url: str | None = None
     settings: dict[str, Any] = Field(default_factory=dict)
     active: bool = True
+    auto_sync_enabled: bool = True
+    sync_interval_hours: int | None = None
 
 
 class SourceUpdateRequest(BaseModel):
@@ -34,6 +43,8 @@ class SourceUpdateRequest(BaseModel):
     base_url: str | None = None
     settings: dict[str, Any] = Field(default_factory=dict)
     active: bool = True
+    auto_sync_enabled: bool = True
+    sync_interval_hours: int | None = None
 
 
 class SourceResponse(BaseModel):
@@ -44,6 +55,10 @@ class SourceResponse(BaseModel):
     base_url: str | None
     settings: dict[str, Any]
     active: bool
+    auto_sync_enabled: bool
+    sync_interval_hours: int
+    last_synced_at: datetime | None
+    next_sync_at: datetime | None
 
 
 class SourceSyncResponse(BaseModel):
@@ -53,6 +68,10 @@ class SourceSyncResponse(BaseModel):
     processed: int
     created: int
     updated: int
+    pending_title_screening: int
+    pending_full_relevance: int
+    last_synced_at: datetime | None
+    next_sync_at: datetime | None
 
 
 def serialize_source(source: JobSource) -> SourceResponse:
@@ -64,6 +83,10 @@ def serialize_source(source: JobSource) -> SourceResponse:
         base_url=source.base_url,
         settings=source.settings_json,
         active=source.active,
+        auto_sync_enabled=source.auto_sync_enabled,
+        sync_interval_hours=source.sync_interval_hours,
+        last_synced_at=source.last_synced_at,
+        next_sync_at=source.next_sync_at,
     )
 
 
@@ -106,7 +129,10 @@ def create_source(
         base_url=payload.base_url,
         settings_json=payload.settings,
         active=payload.active,
+        auto_sync_enabled=payload.auto_sync_enabled,
+        sync_interval_hours=normalize_sync_interval_hours(payload.sync_interval_hours),
     )
+    apply_source_schedule_defaults(source)
     session.add(source)
     session.commit()
     session.refresh(source)
@@ -148,6 +174,9 @@ def update_source(
     source.base_url = payload.base_url
     source.settings_json = payload.settings
     source.active = payload.active
+    source.auto_sync_enabled = payload.auto_sync_enabled
+    source.sync_interval_hours = normalize_sync_interval_hours(payload.sync_interval_hours)
+    apply_source_schedule_defaults(source)
 
     session.commit()
     session.refresh(source)
@@ -176,6 +205,7 @@ def delete_source(
 @router.post("/{source_id}/sync", response_model=SourceSyncResponse)
 def trigger_source_sync(
     source_id: int,
+    background_tasks: BackgroundTasks,
     current_account: Account = Depends(get_current_account),
     session: Session = Depends(get_db_session),
 ) -> SourceSyncResponse:
@@ -187,19 +217,36 @@ def trigger_source_sync(
     )
     if not source:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source not found")
+    if not source.active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Inactive sources must be reactivated before syncing.",
+        )
 
-    if not _source_sync_lock.acquire(blocking=False):
+    if not acquire_source_sync_lease(session, source_id=source.id):
+        session.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="A source sync is already running. Wait for it to finish before starting another one.",
+            detail="This source is already syncing. Wait for it to finish before starting another run.",
         )
+    session.commit()
 
     try:
         summary = sync_source(session, source.id)
+        session.refresh(source)
+        mark_source_synced(source)
+        session.commit()
     except ValueError as exc:
+        release_source_sync_lease(session, source_id=source.id)
+        session.commit()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    finally:
-        _source_sync_lock.release()
+    except Exception:
+        release_source_sync_lease(session, source_id=source.id)
+        session.commit()
+        raise
+
+    if summary["pending_title_screening"] or summary["pending_full_relevance"]:
+        background_tasks.add_task(drain_relevance_tasks_for_account, current_account.id)
 
     return SourceSyncResponse(
         source_id=source.id,
@@ -208,4 +255,8 @@ def trigger_source_sync(
         processed=summary["processed"],
         created=summary["created"],
         updated=summary["updated"],
+        pending_title_screening=summary["pending_title_screening"],
+        pending_full_relevance=summary["pending_full_relevance"],
+        last_synced_at=source.last_synced_at,
+        next_sync_at=source.next_sync_at,
     )

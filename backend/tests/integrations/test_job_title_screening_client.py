@@ -11,18 +11,52 @@ from app.integrations.openai.job_title_screening import (
 class _FakeCompletions:
     def __init__(self, content: str) -> None:
         self._content = content
+        self.with_raw_response = _FakeRawCompletions(content)
 
     def create(self, **kwargs):
+        content = self._content
+
         class _Message:
-            content = self._content
+            pass
+
+        msg = _Message()
+        msg.content = content
 
         class _Choice:
-            message = _Message()
+            message = msg
 
         class _Response:
             choices = [_Choice()]
 
         return _Response()
+
+
+class _FakeRawCompletions:
+    def __init__(self, content: str) -> None:
+        self._content = content
+
+    def create(self, **kwargs):
+        content = self._content
+
+        class _Message:
+            pass
+
+        msg = _Message()
+        msg.content = content
+
+        class _Choice:
+            message = msg
+
+        class _ParsedResponse:
+            choices = [_Choice()]
+
+        class _RawResponse:
+            headers = {}
+
+            def parse(self_):
+                return _ParsedResponse()
+
+        return _RawResponse()
 
 
 class _FakeChat:
@@ -139,9 +173,10 @@ def test_classify_job_titles_does_not_accept_malformed_rejects() -> None:
         ),
     )
 
-    assert result.items[0].source == "system_fallback"
     assert result.items[0].decision == "pass"
-    assert result.items[0].failure_cause == "provider_response_invalid"
+    assert result.items[0].source == "ai"
+    assert result.items[0].failure_cause is None
+    assert result.items[0].decision_rationale_type == "ambiguous_but_passed"
 
 
 @pytest.mark.parametrize("title", [
@@ -212,10 +247,29 @@ def test_hardware_engineer_rejects_when_ai_returns_clear_family_mismatch() -> No
     assert result.items[0].payload["role_family_alignment"] == "different_family"
 
 
+def _wrap_raw(completions_instance):
+    class _WithRaw:
+        def create(self_, **kwargs):
+            inner = completions_instance.create(**kwargs)
+
+            class _RawResponse:
+                headers = {}
+
+                def parse(self__):
+                    return inner
+
+            return _RawResponse()
+
+    return _WithRaw()
+
+
 def test_unsafe_reject_overridden_to_pass_without_third_ai_call() -> None:
     ai_calls: list[dict] = []
 
     class _TrackingCompletions:
+        def __init__(self):
+            self.with_raw_response = _wrap_raw(self)
+
         def create(self, **kwargs):
             ai_calls.append(kwargs)
 
@@ -227,11 +281,9 @@ def test_unsafe_reject_overridden_to_pass_without_third_ai_call() -> None:
                       "title_index": 0,
                       "decision": "reject",
                       "summary": "Ambiguous seniority signals.",
-                      "decision_rationale_type": "clear_seniority_mismatch",
+                      "decision_rationale_type": "clear_family_mismatch",
                       "role_family_alignment": "same_family",
-                      "seniority_alignment": "incompatible",
-                      "modifier_impact": "specialization_only",
-                      "contradiction_strength": "moderate"
+                      "seniority_alignment": "compatible"
                     }
                   ]
                 }
@@ -267,6 +319,9 @@ def test_phase1_system_prompt_includes_role_family_context_for_early_career() ->
     captured_kwargs: list[dict] = []
 
     class _CapturingCompletions:
+        def __init__(self):
+            self.with_raw_response = _wrap_raw(self)
+
         def create(self, **kwargs):
             captured_kwargs.append(kwargs)
 
@@ -338,7 +393,7 @@ def test_classify_job_titles_keeps_item_metadata_when_one_batch_falls_back(monke
                 model_name="groq-test",
                 failure_cause=None,
                 payload={"batch": 1},
-            )
+            ), None
         raise ValueError("bad output")
 
     monkeypatch.setattr(job_title_screening, "_classify_batch_with_ai", fake_classify_batch_with_ai)

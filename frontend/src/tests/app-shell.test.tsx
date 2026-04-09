@@ -2,7 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import { RouterProvider } from "react-router-dom";
 
 import { createMemoryAppRouter } from "../app/router";
-import type { AppApi } from "../lib/api";
+import type { AnswerFileUploadPayload, AppApi } from "../lib/api";
 
 function buildApi(authenticated: boolean): AppApi {
   return {
@@ -13,8 +13,8 @@ function buildApi(authenticated: boolean): AppApi {
     login: async () => ({ authenticated: true, email: "owner@example.com" }),
     logout: async () => undefined,
     listSources: async () => [],
-    createSource: async (payload) => ({ id: 1, ...payload }),
-    updateSource: async (sourceId, payload) => ({ id: sourceId, ...payload }),
+    createSource: async (payload) => ({ id: 1, last_synced_at: null, next_sync_at: null, sync_interval_hours: payload.sync_interval_hours ?? 6, ...payload }),
+    updateSource: async (sourceId, payload) => ({ id: sourceId, last_synced_at: null, next_sync_at: null, sync_interval_hours: payload.sync_interval_hours ?? 6, ...payload }),
     deleteSource: async () => undefined,
     syncSource: async () => ({
       source_id: 1,
@@ -23,6 +23,8 @@ function buildApi(authenticated: boolean): AppApi {
       processed: 0,
       created: 0,
       updated: 0,
+      pending_title_screening: 0,
+      pending_full_relevance: 0,
     }),
     getRoleProfile: async () => ({
       id: 1,
@@ -33,6 +35,13 @@ function buildApi(authenticated: boolean): AppApi {
     saveRoleProfile: async (payload) => ({ id: 1, ...payload }),
     listAnswers: async () => [],
     createAnswer: async (payload) => ({ id: 1, ...payload }),
+    uploadAnswerFile: async (payload: AnswerFileUploadPayload) => ({
+      id: 1,
+      question_template_id: payload.question_template_id,
+      label: payload.label,
+      answer_text: null,
+      answer_payload: { kind: "file", filename: payload.file.name },
+    }),
     updateAnswer: async (answerId, payload) => ({ id: answerId, ...payload }),
     listQuestionTasks: async () => [],
     resolveQuestionTask: async (taskId, payload) => ({
