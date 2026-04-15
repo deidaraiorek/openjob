@@ -17,6 +17,11 @@ def test_parse_markdown_jobs_extracts_company_title_location_and_apply_url() -> 
     assert record.location == "Remote"
     assert record.listing_url == "https://simplify.jobs/jobs/acme-1"
     assert record.apply_url == "https://boards.greenhouse.io/acme/jobs/123"
+    assert record.raw_payload["outbound_links"] == [
+        {"kind": "company", "label": "Acme", "url": "https://acme.example"},
+        {"kind": "listing", "label": "Software Engineer I", "url": "https://simplify.jobs/jobs/acme-1"},
+        {"kind": "apply", "label": "Apply", "url": "https://boards.greenhouse.io/acme/jobs/123"},
+    ]
 
 
 def test_parse_markdown_jobs_extracts_jobs_from_html_tables() -> None:
@@ -50,3 +55,7 @@ def test_parse_markdown_jobs_extracts_jobs_from_html_tables() -> None:
     assert record.location == "Seattle, WA"
     assert record.listing_url == "https://boards.greenhouse.io/acme/jobs/123"
     assert record.apply_url == "https://boards.greenhouse.io/acme/jobs/123"
+    assert record.raw_payload["outbound_links"] == [
+        {"kind": "company", "label": "Acme", "url": "https://simplify.jobs/c/Acme"},
+        {"kind": "apply", "label": None, "url": "https://boards.greenhouse.io/acme/jobs/123"},
+    ]

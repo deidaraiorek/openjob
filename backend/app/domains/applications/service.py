@@ -6,8 +6,16 @@ from typing import Any, Callable
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+import httpx
+
 from app.db.base import utcnow
 from app.domains.accounts.models import Account
+from app.domains.application_accounts.service import (
+    decrypt_secret,
+    ensure_target_ready,
+    find_application_account_for_target,
+)
+from app.domains.applications.driver_registry import resolve_driver
 from app.domains.applications.models import ApplicationEvent, ApplicationRun
 from app.domains.applications.redaction import redact_payload
 from app.domains.applications.retry_policy import (
@@ -18,8 +26,12 @@ from app.domains.applications.retry_policy import (
 )
 from app.domains.jobs.models import ApplyTarget, Job
 from app.domains.questions.matching import ensure_question_task, resolve_questions
+from app.integrations.ai_browser.apply import execute_ai_browser_run
+from app.integrations.ashby import apply as ashby_apply
 from app.integrations.greenhouse import apply as greenhouse_apply
 from app.integrations.lever import apply as lever_apply
+from app.integrations.linkedin.apply import execute_linkedin_application_run
+from app.integrations.smartrecruiters import apply as smartrecruiters_apply
 
 
 @dataclass(slots=True)
@@ -39,13 +51,23 @@ def _log_event(run: ApplicationRun, event_type: str, payload: dict[str, Any]) ->
 
 
 def _default_fetch_questions(apply_target: ApplyTarget):
-    if apply_target.target_type == "greenhouse_apply":
-        board_token = apply_target.metadata_json["board_token"]
-        job_post_id = apply_target.metadata_json["job_post_id"]
-        return greenhouse_apply.fetch_question_payload(board_token, job_post_id)
-    if apply_target.target_type == "lever_apply":
-        posting_id = apply_target.metadata_json["posting_id"]
-        return lever_apply.fetch_question_payload(posting_id)
+    try:
+        if apply_target.target_type == "greenhouse_apply":
+            board_token = apply_target.metadata_json["board_token"]
+            job_post_id = apply_target.metadata_json["job_post_id"]
+            return greenhouse_apply.fetch_question_payload(board_token, job_post_id)
+        if apply_target.target_type == "lever_apply":
+            posting_id = apply_target.metadata_json["posting_id"]
+            company_slug = apply_target.metadata_json.get("company_slug")
+            return lever_apply.fetch_question_payload(posting_id, company_slug)
+        if apply_target.target_type == "ashby_apply":
+            job_posting_id = apply_target.metadata_json["job_posting_id"]
+            return ashby_apply.fetch_question_payload(job_posting_id)
+        if apply_target.target_type == "smartrecruiters_apply":
+            posting_id = apply_target.metadata_json["posting_id"]
+            return smartrecruiters_apply.fetch_question_payload(posting_id)
+    except Exception as error:  # pragma: no cover - real network path
+        raise _classify_api_error(error) from error
     raise TerminalApplyError(f"Unsupported apply target: {apply_target.target_type}")
 
 
@@ -55,20 +77,35 @@ def _default_submit(apply_target: ApplyTarget, payload: dict[str, Any]) -> dict[
             return greenhouse_apply.submit_application(
                 board_token=apply_target.metadata_json["board_token"],
                 job_post_id=apply_target.metadata_json["job_post_id"],
-                api_key=apply_target.metadata_json["api_key"],
                 submission_payload=payload,
             )
         except Exception as error:  # pragma: no cover - real network path
-            raise RetryableApplyError(str(error)) from error
+            raise _classify_api_error(error) from error
     if apply_target.target_type == "lever_apply":
         try:
             return lever_apply.submit_application(
                 posting_id=apply_target.metadata_json["posting_id"],
-                api_key=apply_target.metadata_json["api_key"],
+                company_slug=apply_target.metadata_json.get("company_slug"),
                 submission_payload=payload,
             )
         except Exception as error:  # pragma: no cover - real network path
-            raise RetryableApplyError(str(error)) from error
+            raise _classify_api_error(error) from error
+    if apply_target.target_type == "ashby_apply":
+        try:
+            return ashby_apply.submit_application(
+                job_posting_id=apply_target.metadata_json["job_posting_id"],
+                submission_payload=payload,
+            )
+        except Exception as error:  # pragma: no cover - real network path
+            raise _classify_api_error(error) from error
+    if apply_target.target_type == "smartrecruiters_apply":
+        try:
+            return smartrecruiters_apply.submit_application(
+                posting_id=apply_target.metadata_json["posting_id"],
+                submission_payload=payload,
+            )
+        except Exception as error:  # pragma: no cover - real network path
+            raise _classify_api_error(error) from error
     raise TerminalApplyError(f"Unsupported apply target: {apply_target.target_type}")
 
 
@@ -77,6 +114,10 @@ def _parse_questions(apply_target: ApplyTarget, payload: Any):
         return greenhouse_apply.parse_question_payload(payload)
     if apply_target.target_type == "lever_apply":
         return lever_apply.parse_question_payload(payload)
+    if apply_target.target_type == "ashby_apply":
+        return ashby_apply.parse_question_payload(payload)
+    if apply_target.target_type == "smartrecruiters_apply":
+        return smartrecruiters_apply.parse_question_payload(payload)
     raise TerminalApplyError(f"Unsupported apply target: {apply_target.target_type}")
 
 
@@ -90,6 +131,10 @@ def _build_submission_payload(
         return greenhouse_apply.build_submission_payload(questions, answers_by_key)
     if apply_target.target_type == "lever_apply":
         return lever_apply.build_submission_payload(questions, answers_by_key)
+    if apply_target.target_type == "ashby_apply":
+        return ashby_apply.build_submission_payload(questions, answers_by_key)
+    if apply_target.target_type == "smartrecruiters_apply":
+        return smartrecruiters_apply.build_submission_payload(questions, answers_by_key)
     raise TerminalApplyError(f"Unsupported apply target: {apply_target.target_type}")
 
 
@@ -122,6 +167,51 @@ def execute_application_run(
         raise TerminalApplyError("Job not found")
 
     apply_target = _select_preferred_apply_target(job)
+    ensure_target_ready(session, account_id=account.id, target=apply_target)
+    driver = resolve_driver(apply_target)
+
+    if driver.key == "linkedin_browser":
+        return execute_linkedin_application_run(
+            session,
+            account=account,
+            job_id=job.id,
+        )
+
+    if driver.key == "ai_browser":
+        app_account = find_application_account_for_target(session, account_id=account.id, target=apply_target)
+        credential = decrypt_secret(app_account.secret_ciphertext) if app_account else None
+        ai_result = execute_ai_browser_run(
+            session,
+            account=account,
+            job_id=job.id,
+            credential=credential,
+        )
+        return ApplyResult(
+            application_run_id=ai_result.application_run_id,
+            status=ai_result.status,
+            answer_entry_ids=ai_result.answer_entry_ids,
+            created_question_task_ids=ai_result.created_question_task_ids,
+        )
+
+    return _execute_direct_api_application_run(
+        session,
+        account=account,
+        job=job,
+        apply_target=apply_target,
+        fetch_questions=fetch_questions,
+        submit_application=submit_application,
+    )
+
+
+def _execute_direct_api_application_run(
+    session: Session,
+    *,
+    account: Account,
+    job: Job,
+    apply_target: ApplyTarget,
+    fetch_questions: FetchQuestionsFn | None = None,
+    submit_application: SubmitFn | None = None,
+) -> ApplyResult:
     run = ApplicationRun(
         account_id=account.id,
         job_id=job.id,
@@ -215,6 +305,26 @@ def execute_application_run(
         )
     except Exception as error:
         decision = classify_apply_exception(error)
+        if decision.status == "failed" and apply_target.destination_url:
+            _log_event(
+                run,
+                "browser_fallback_attempted",
+                {"reason": str(error), "target_type": apply_target.target_type},
+            )
+            session.flush()
+            ai_result = execute_ai_browser_run(
+                session,
+                account=account,
+                job_id=job.id,
+                destination_url=apply_target.destination_url,
+                run=run,
+            )
+            return ApplyResult(
+                application_run_id=ai_result.application_run_id,
+                status=ai_result.status,
+                answer_entry_ids=ai_result.answer_entry_ids,
+                created_question_task_ids=ai_result.created_question_task_ids,
+            )
         run.status = decision.status
         run.completed_at = utcnow()
         _log_event(
@@ -229,3 +339,11 @@ def execute_application_run(
             answer_entry_ids=[],
             created_question_task_ids=[],
         )
+
+
+def _classify_api_error(error: Exception) -> Exception:
+    if isinstance(error, httpx.HTTPStatusError):
+        status_code = error.response.status_code
+        if 400 <= status_code < 500:
+            return TerminalApplyError(str(error))
+    return RetryableApplyError(str(error))

@@ -61,6 +61,10 @@ def test_sync_source_ingests_greenhouse_jobs_and_creates_title_screening_tasks(d
         "updated": 0,
         "pending_title_screening": 1,
         "pending_full_relevance": 0,
+        "api_compatible_targets": 1,
+        "browser_compatible_targets": 0,
+        "manual_only_targets": 0,
+        "resolution_failed_targets": 0,
     }
     assert job is not None
     assert job.relevance_decision == "pending"
@@ -144,6 +148,10 @@ def test_sync_source_inline_title_screening_enqueues_full_relevance_for_pass(db_
         "updated": 0,
         "pending_title_screening": 0,
         "pending_full_relevance": 1,
+        "api_compatible_targets": 1,
+        "browser_compatible_targets": 0,
+        "manual_only_targets": 0,
+        "resolution_failed_targets": 0,
     }
     assert job is not None
     assert job.relevance_decision == "pending"
@@ -214,6 +222,17 @@ def test_sync_source_inline_title_screening_writes_reject_for_out_of_scope_title
 </table>
 """
 
+    monkeypatch.setattr(
+        "app.domains.sources.link_resolution.resolve_link",
+        lambda source_url, **_: type("Resolved", (), {
+            "source_url": source_url,
+            "resolved_url": source_url,
+            "redirect_chain": [],
+            "failure_reason": None,
+            "page_body": None,
+        })(),
+    )
+
     summary = sync_source(db_session, source.id, raw_payload=markdown)
 
     job = db_session.scalar(select(Job))
@@ -226,6 +245,10 @@ def test_sync_source_inline_title_screening_writes_reject_for_out_of_scope_title
         "updated": 0,
         "pending_title_screening": 0,
         "pending_full_relevance": 0,
+        "api_compatible_targets": 0,
+        "browser_compatible_targets": 1,
+        "manual_only_targets": 0,
+        "resolution_failed_targets": 0,
     }
     assert job is not None
     assert job.relevance_decision == "reject"
@@ -278,6 +301,10 @@ def test_sync_source_derives_greenhouse_board_token_from_base_url(db_session, mo
         "updated": 0,
         "pending_title_screening": 0,
         "pending_full_relevance": 0,
+        "api_compatible_targets": 1,
+        "browser_compatible_targets": 0,
+        "manual_only_targets": 0,
+        "resolution_failed_targets": 0,
     }
     assert target is not None
     assert target.metadata_json["board_token"] == "alt"

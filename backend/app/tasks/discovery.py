@@ -18,6 +18,7 @@ from app.domains.jobs.relevance import (
 from app.domains.jobs.models import Job, JobRelevanceTask
 from app.domains.role_profiles.models import RoleProfile
 from app.domains.sources.models import JobSource
+from app.domains.sources.link_resolution import resolve_github_candidates, summarize_candidate_targets
 from app.domains.sources.sync_control import (
     acquire_source_sync_lease,
     mark_source_synced,
@@ -25,11 +26,15 @@ from app.domains.sources.sync_control import (
     select_due_source_ids,
 )
 from app.domains.sources.url_normalization import (
+    derive_ashby_organization_host_token,
     derive_greenhouse_board_token,
     derive_lever_company_slug,
+    derive_smartrecruiters_company_identifier,
     resolve_github_raw_url,
 )
 from app.db.session import get_session_factory
+from app.integrations.ashby.client import fetch_job_postings as fetch_ashby_postings
+from app.integrations.ashby.client import parse_postings as parse_ashby_postings
 from app.integrations.github_curated.client import fetch_markdown
 from app.integrations.github_curated.parser import parse_markdown_jobs
 from app.integrations.greenhouse.client import fetch_jobs as fetch_greenhouse_jobs
@@ -37,8 +42,24 @@ from app.integrations.greenhouse.client import parse_jobs as parse_greenhouse_jo
 from app.integrations.lever.client import fetch_postings as fetch_lever_postings
 from app.integrations.lever.client import parse_postings as parse_lever_postings
 from app.integrations.linkedin.discovery import parse_search_results as parse_linkedin_search_results
+from app.integrations.smartrecruiters.client import fetch_postings as fetch_smartrecruiters_postings
+from app.integrations.smartrecruiters.client import parse_postings as parse_smartrecruiters_postings
 from app.tasks.job_relevance import drain_relevance_tasks_for_account, drain_relevance_tasks_now
 HARD_REJECT_SCORE_THRESHOLD = 0.15
+
+
+def empty_sync_summary() -> dict[str, int]:
+    return {
+        "processed": 0,
+        "created": 0,
+        "updated": 0,
+        "pending_title_screening": 0,
+        "pending_full_relevance": 0,
+        "api_compatible_targets": 0,
+        "browser_compatible_targets": 0,
+        "manual_only_targets": 0,
+        "resolution_failed_targets": 0,
+    }
 
 
 def _is_hard_reject(result) -> bool:
@@ -70,7 +91,10 @@ def _load_role_profile(session: Session, source: JobSource) -> RoleProfile | Non
 def load_candidates(source: JobSource, raw_payload: Any = None) -> list[DiscoveryCandidate]:
     if source.source_type == "github_curated":
         markdown = raw_payload if raw_payload is not None else fetch_markdown(resolve_github_raw_url(source))
-        return parse_markdown_jobs(markdown)
+        return resolve_github_candidates(
+            parse_markdown_jobs(markdown),
+            settings=source.settings_json,
+        )
 
     if source.source_type == "greenhouse_board":
         board_token = derive_greenhouse_board_token(source)
@@ -89,6 +113,24 @@ def load_candidates(source: JobSource, raw_payload: Any = None) -> list[Discover
             company_slug=company_slug,
             company_name=source.settings_json.get("company_name"),
             api_key=source.settings_json.get("api_key"),
+        )
+
+    if source.source_type == "ashby_board":
+        organization_host_token = derive_ashby_organization_host_token(source)
+        payload = raw_payload if raw_payload is not None else fetch_ashby_postings(organization_host_token)
+        return parse_ashby_postings(
+            payload,
+            organization_host_token=organization_host_token,
+            company_name=source.settings_json.get("company_name"),
+        )
+
+    if source.source_type == "smartrecruiters_board":
+        company_identifier = derive_smartrecruiters_company_identifier(source)
+        payload = raw_payload if raw_payload is not None else fetch_smartrecruiters_postings(company_identifier)
+        return parse_smartrecruiters_postings(
+            payload,
+            company_identifier=company_identifier,
+            company_name=source.settings_json.get("company_name"),
         )
 
     if source.source_type == "linkedin_search":
@@ -133,17 +175,12 @@ def sync_source(session: Session, source_id: int, raw_payload: Any = None) -> di
     if not source:
         raise ValueError(f"Unknown source: {source_id}")
     if not source.active:
-        return {
-            "processed": 0,
-            "created": 0,
-            "updated": 0,
-            "pending_title_screening": 0,
-            "pending_full_relevance": 0,
-        }
+        return empty_sync_summary()
 
     account = ensure_account(session, source.account.email if source.account else "owner@example.com")
     profile = _load_role_profile(session, source)
     candidates = load_candidates(source, raw_payload=raw_payload)
+    compatibility_summary = summarize_candidate_targets(candidates)
     touched_job_ids: list[int] = []
 
     processed = 0
@@ -229,13 +266,17 @@ def sync_source(session: Session, source_id: int, raw_payload: Any = None) -> di
             JobRelevanceTask.phase == "full_relevance",
         )
     ) or 0
-    return {
+    summary = {
         "processed": processed,
         "created": created,
         "updated": updated,
         "pending_title_screening": pending_title_screening,
         "pending_full_relevance": pending_full_relevance,
+        **compatibility_summary,
     }
+    source.last_sync_summary_json = summary
+    session.flush()
+    return summary
 
 
 def sync_all_sources_now() -> list[dict[str, int]]:
@@ -258,28 +299,16 @@ def sync_source_task(source_id: int) -> dict[str, int]:
     with session_factory() as session:
         source = session.get(JobSource, source_id)
         if not source or not source.active:
-            return {
-                "processed": 0,
-                "created": 0,
-                "updated": 0,
-                "pending_title_screening": 0,
-                "pending_full_relevance": 0,
-            }
+            return empty_sync_summary()
 
         if not acquire_source_sync_lease(session, source_id=source_id):
             session.rollback()
-            return {
-                "processed": 0,
-                "created": 0,
-                "updated": 0,
-                "pending_title_screening": 0,
-                "pending_full_relevance": 0,
-            }
+            return empty_sync_summary()
         session.commit()
 
         try:
             summary = sync_source(session, source_id)
-            session.refresh(source)
+            source.last_sync_summary_json = summary
             mark_source_synced(source)
             session.commit()
         except Exception:

@@ -1,8 +1,9 @@
+import pytest
 from sqlalchemy import func, select
 
 from app.domains.accounts.service import ensure_account
 from app.domains.applications.models import ApplicationEvent, ApplicationRun
-from app.domains.applications.retry_policy import ActionNeededApplyError, RetryableApplyError
+from app.domains.applications.retry_policy import ActionNeededApplyError, RetryableApplyError, TerminalApplyError
 from app.domains.applications.service import execute_application_run
 from app.domains.jobs.models import ApplyTarget, Job
 from app.domains.questions.fingerprints import fingerprint_question
@@ -207,3 +208,168 @@ def test_execute_application_run_marks_retryable_failures(db_session) -> None:
 
     assert retry_result.status == "retry_scheduled"
     assert action_result.status == "action_needed"
+
+
+def test_execute_application_run_rejects_targets_that_are_not_ready(db_session) -> None:
+    account = ensure_account(db_session, "owner@example.com")
+    job = Job(
+        account_id=account.id,
+        canonical_key="acme-workday-software-engineer",
+        company_name="Acme",
+        title="Software Engineer",
+        location="Remote",
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    db_session.add(
+        ApplyTarget(
+            job_id=job.id,
+            target_type="external_link",
+            destination_url="https://acme.wd1.myworkdaysite.com/recruiting/acme/job/123",
+            is_preferred=True,
+            metadata_json={},
+        )
+    )
+    db_session.commit()
+
+    with pytest.raises(TerminalApplyError, match="Workday link is recognized"):
+        execute_application_run(
+            db_session,
+            account=account,
+            job_id=job.id,
+            fetch_questions=lambda _: {"questions": []},
+            submit_application=lambda *_: {"status": "submitted"},
+        )
+
+
+def test_execute_application_run_passes_lever_company_slug_to_question_fetch(db_session, monkeypatch) -> None:
+    account = ensure_account(db_session, "owner@example.com")
+    job = Job(
+        account_id=account.id,
+        canonical_key="weride-software-engineer-algorithm",
+        company_name="WeRide",
+        title="New Grads 2026 - Software Engineer - Algorithm",
+        location="Remote",
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    apply_target = ApplyTarget(
+        job_id=job.id,
+        target_type="lever_apply",
+        destination_url="https://jobs.lever.co/weride/posting-123/apply",
+        is_preferred=True,
+        metadata_json={
+            "posting_id": "posting-123",
+            "company_slug": "weride",
+            "api_key": "secret",
+        },
+    )
+    db_session.add(apply_target)
+    db_session.commit()
+
+    fetch_calls: list[tuple[str, str | None]] = []
+
+    def fake_fetch_question_payload(posting_id: str, company_slug: str | None = None) -> dict:
+        fetch_calls.append((posting_id, company_slug))
+        return {}
+
+    monkeypatch.setattr(
+        "app.domains.applications.service.lever_apply.fetch_question_payload",
+        fake_fetch_question_payload,
+    )
+
+    result = execute_application_run(
+        db_session,
+        account=account,
+        job_id=job.id,
+        submit_application=lambda *_: {"status": "submitted"},
+    )
+
+    assert result.status == "submitted"
+    assert fetch_calls == [("posting-123", "weride")]
+
+
+def test_execute_application_run_passes_lever_company_slug_to_submit(db_session, monkeypatch) -> None:
+    account = ensure_account(db_session, "owner@example.com")
+    job = Job(
+        account_id=account.id,
+        canonical_key="weride-software-engineer-general",
+        company_name="WeRide",
+        title="New Grads 2026 - General Software Engineer",
+        location="Remote",
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    apply_target = ApplyTarget(
+        job_id=job.id,
+        target_type="lever_apply",
+        destination_url="https://jobs.lever.co/weride/posting-123/apply",
+        is_preferred=True,
+        metadata_json={
+            "posting_id": "posting-123",
+            "company_slug": "weride",
+        },
+    )
+    db_session.add(apply_target)
+    db_session.commit()
+
+    template = QuestionTemplate(
+        account_id=account.id,
+        fingerprint=fingerprint_question("Full name", "text", []),
+        prompt_text="Full name",
+        field_type="text",
+        option_labels=[],
+    )
+    db_session.add(template)
+    db_session.commit()
+    db_session.refresh(template)
+
+    answer = AnswerEntry(
+        account_id=account.id,
+        question_template_id=template.id,
+        label="Full name",
+        answer_text="Dang Pham",
+    )
+    db_session.add(answer)
+    db_session.commit()
+
+    monkeypatch.setattr(
+        "app.domains.applications.service.lever_apply.fetch_question_payload",
+        lambda posting_id, company_slug=None: {
+            "personalInformation": [
+                {"name": "name", "text": "Full name", "type": "text", "required": True},
+            ]
+        },
+    )
+
+    submit_calls: list[tuple[str, str | None, dict[str, object]]] = []
+
+    def fake_submit_application(posting_id: str, submission_payload: dict[str, object], company_slug: str | None = None):
+        submit_calls.append((posting_id, company_slug, submission_payload))
+        return {"status": "submitted"}
+
+    monkeypatch.setattr(
+        "app.domains.applications.service.lever_apply.submit_application",
+        fake_submit_application,
+    )
+
+    result = execute_application_run(
+        db_session,
+        account=account,
+        job_id=job.id,
+    )
+
+    assert result.status == "submitted"
+    assert submit_calls == [
+        (
+            "posting-123",
+            "weride",
+            {"fields": [{"name": "name", "value": "Dang Pham"}]},
+        )
+    ]

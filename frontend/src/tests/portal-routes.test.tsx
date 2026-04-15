@@ -8,14 +8,20 @@ import type {
   AnswerFileUploadPayload,
   AppApi,
   AnswerEntry,
+  ApplicationAccount,
   JobDetail,
   JobListItem,
+  QuestionAlias,
   QuestionTask,
   RoleProfile,
   Source,
   SourceSyncResult,
   TriggerApplicationRunResult,
 } from "../lib/api";
+
+beforeEach(() => {
+  window.localStorage.clear();
+});
 
 function createMockApi(overrides?: Partial<AppApi>): AppApi {
   const sources: Source[] = [
@@ -42,6 +48,19 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
       answer_payload: {},
     },
   ];
+  const applicationAccounts: ApplicationAccount[] = [
+    {
+      id: 1,
+      platform_family: "icims",
+      platform_label: "iCIMS",
+      tenant_host: "acme.icims.com",
+      login_identifier_masked: "o***r@example.com",
+      credential_status: "ready",
+      last_successful_at: "2026-04-08T09:00:00Z",
+      last_failure_at: null,
+      last_failure_message: null,
+    },
+  ];
   const questions: QuestionTask[] = [
     {
       id: 1,
@@ -54,6 +73,7 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
       linked_answer_entry_id: null,
     },
   ];
+  const questionAliases: QuestionAlias[] = [];
   const jobs: JobListItem[] = [
     {
       id: 1,
@@ -69,6 +89,12 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
       relevance_failure_cause: null,
       relevance_decision_phase: null,
       preferred_apply_target_type: "greenhouse_apply",
+      preferred_apply_target_platform_family: "greenhouse",
+      preferred_apply_target_platform_label: "Greenhouse",
+      preferred_apply_target_driver_family: "direct_api",
+      preferred_apply_target_credential_policy: "not_needed",
+      preferred_apply_target_readiness_status: "ready",
+      preferred_apply_target_readiness_reason: null,
       sighting_count: 2,
       open_question_task_count: 1,
       latest_application_run_status: null,
@@ -93,6 +119,13 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
       target_type: "greenhouse_apply",
       destination_url: "https://boards.greenhouse.io/acme/jobs/1",
       is_preferred: true,
+      platform_family: "greenhouse",
+      platform_label: "Greenhouse",
+      driver_family: "direct_api",
+      credential_policy: "not_needed",
+      readiness_status: "ready",
+      readiness_reason: null,
+      tenant_host: "boards.greenhouse.io",
     },
     question_tasks: [],
     application_runs: [],
@@ -138,12 +171,13 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
     logout: async () => undefined,
     listSources: async () => sources,
     createSource: async (payload) => {
+      const { sync_interval_hours, ...rest } = payload;
       const next = {
         id: sources.length + 1,
+        ...rest,
+        sync_interval_hours: sync_interval_hours ?? 6,
         last_synced_at: null,
         next_sync_at: payload.active && payload.auto_sync_enabled ? "2026-04-08T14:00:00Z" : null,
-        sync_interval_hours: payload.sync_interval_hours ?? 6,
-        ...payload,
       };
       sources.push(next);
       return next;
@@ -179,6 +213,41 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
     },
     getRoleProfile: async () => roleProfile,
     saveRoleProfile: async (payload) => ({ id: 1, ...payload }),
+    listApplicationAccounts: async () => applicationAccounts,
+    createApplicationAccount: async (payload) => {
+      const next: ApplicationAccount = {
+        id: applicationAccounts.length + 1,
+        platform_family: payload.platform_family,
+        platform_label: payload.platform_family === "jobvite" ? "Jobvite" : payload.platform_family,
+        tenant_host: payload.tenant_host ?? "",
+        login_identifier_masked: "n*****r@example.com",
+        credential_status: "ready",
+        last_successful_at: null,
+        last_failure_at: null,
+        last_failure_message: null,
+      };
+      applicationAccounts.push(next);
+      return next;
+    },
+    updateApplicationAccount: async (applicationAccountId, payload) => {
+      const account = applicationAccounts.find((item) => item.id === applicationAccountId)!;
+      account.platform_family = payload.platform_family;
+      account.platform_label = payload.platform_family === "jobvite" ? "Jobvite" : payload.platform_family;
+      account.tenant_host = payload.tenant_host ?? "";
+      if (payload.login_identifier) {
+        account.login_identifier_masked = "u*****d@example.com";
+      }
+      account.credential_status = "ready";
+      account.last_failure_at = null;
+      account.last_failure_message = null;
+      return account;
+    },
+    deleteApplicationAccount: async (applicationAccountId) => {
+      const index = applicationAccounts.findIndex((item) => item.id === applicationAccountId);
+      if (index >= 0) {
+        applicationAccounts.splice(index, 1);
+      }
+    },
     listAnswers: async () => answers,
     createAnswer: async (payload) => {
       const next = { id: answers.length + 1, ...payload };
@@ -206,6 +275,16 @@ function createMockApi(overrides?: Partial<AppApi>): AppApi {
       return answer;
     },
     listQuestionTasks: async () => questions,
+    listQuestionAliases: async () => questionAliases,
+    updateQuestionAlias: async (aliasId, status) => ({
+      id: aliasId,
+      source_fingerprint: "source",
+      canonical_fingerprint: "canonical",
+      source_prompt: "Source prompt",
+      canonical_prompt: "Canonical prompt",
+      status,
+      similarity_score: 0,
+    }),
     resolveQuestionTask: async (taskId, payload) => {
       const task = questions.find((item) => item.id === taskId)!;
       task.status = payload.status;
@@ -273,7 +352,7 @@ test("renders the jobs route inside the portal layout", async () => {
 
   expect(await screen.findByRole("heading", { name: /tracked opportunities/i })).toBeInTheDocument();
   expect(await screen.findByRole("link", { name: /acme/i })).toBeInTheDocument();
-  expect(await screen.findAllByText(/greenhouse apply/i)).not.toHaveLength(0);
+  expect(await screen.findAllByText(/greenhouse/i)).not.toHaveLength(0);
   expect(await screen.findByRole("button", { name: /run now/i })).toBeInTheDocument();
 });
 
@@ -413,7 +492,14 @@ test("normalizes github blob urls when editing a github curated source", async (
       ],
       updateSource: async (sourceId, payload) => {
         savedBaseUrl = payload.base_url ?? "";
-        return { id: sourceId, ...payload };
+        const { sync_interval_hours, ...rest } = payload;
+        return {
+          id: sourceId,
+          ...rest,
+          sync_interval_hours: sync_interval_hours ?? 6,
+          last_synced_at: null,
+          next_sync_at: payload.active && payload.auto_sync_enabled ? "2026-04-08T14:00:00Z" : null,
+        };
       },
     }),
     ["/sources"],
@@ -486,6 +572,58 @@ test("manual sync updates the displayed last sync timestamp", async () => {
   expect(screen.getByText("4/8/2026, 12:30:00 PM")).toBeInTheDocument();
 });
 
+test("manual sync keeps the returned timestamp even if the next source refresh is stale", async () => {
+  const user = userEvent.setup();
+  const staleSources: Source[] = [
+    {
+      id: 1,
+      source_key: "greenhouse",
+      source_type: "greenhouse_board",
+      name: "Greenhouse",
+      base_url: "https://boards.greenhouse.io/acme",
+      settings: {},
+      active: true,
+      auto_sync_enabled: true,
+      sync_interval_hours: 6,
+      last_synced_at: "2026-04-08T08:00:00Z",
+      next_sync_at: "2026-04-08T14:00:00Z",
+    },
+  ];
+  let listCallCount = 0;
+  const router = createMemoryAppRouter(
+    createMockApi({
+      listSources: async () => {
+        listCallCount += 1;
+        return staleSources;
+      },
+      syncSource: async () => ({
+        source_id: 1,
+        source_key: "greenhouse",
+        source_type: "greenhouse_board",
+        processed: 6,
+        created: 2,
+        updated: 4,
+        pending_title_screening: 1,
+        pending_full_relevance: 3,
+        last_synced_at: "2026-04-08T10:30:00Z",
+        next_sync_at: "2026-04-08T16:30:00Z",
+      }),
+    }),
+    ["/sources"],
+  );
+
+  render(<RouterProvider router={router} />);
+
+  await screen.findByRole("heading", { name: /discovery inputs/i });
+  await user.click(await screen.findByRole("button", { name: /show details/i }));
+  await user.click(screen.getByRole("button", { name: /sync now/i }));
+
+  await waitFor(() => {
+    expect(screen.getByText("4/8/2026, 6:30:00 AM")).toBeInTheDocument();
+  });
+  expect(listCallCount).toBeGreaterThan(1);
+});
+
 test("shows auto-sync controls and sync schedule details on the sources screen", async () => {
   const user = userEvent.setup();
   const router = createMemoryAppRouter(createMockApi(), ["/sources"]);
@@ -500,6 +638,54 @@ test("shows auto-sync controls and sync schedule details on the sources screen",
   await user.click(screen.getByRole("button", { name: /show details/i }));
   expect(screen.getByText(/last sync/i)).toBeInTheDocument();
   expect(screen.getByText(/next sync/i)).toBeInTheDocument();
+});
+
+test("uses the selected timezone when rendering source sync timestamps", async () => {
+  const user = userEvent.setup();
+  window.localStorage.setItem("openjob.portal.timezone", "America/Los_Angeles");
+  const router = createMemoryAppRouter(createMockApi(), ["/sources"]);
+
+  render(<RouterProvider router={router} />);
+
+  await screen.findByRole("heading", { name: /discovery inputs/i });
+  await user.click(await screen.findByRole("button", { name: /show details/i }));
+
+  expect(screen.getByText("America/Los_Angeles")).toBeInTheDocument();
+  expect(screen.getByText("4/8/2026, 1:00:00 AM")).toBeInTheDocument();
+  expect(screen.getByText("4/8/2026, 7:00:00 AM")).toBeInTheDocument();
+});
+
+test("treats naive source timestamps from the API as UTC before applying the chosen timezone", async () => {
+  const user = userEvent.setup();
+  window.localStorage.setItem("openjob.portal.timezone", "America/Los_Angeles");
+  const router = createMemoryAppRouter(
+    createMockApi({
+      listSources: async () => [
+        {
+          id: 1,
+          source_key: "greenhouse",
+          source_type: "greenhouse_board",
+          name: "Greenhouse",
+          base_url: "https://boards.greenhouse.io/acme",
+          settings: {},
+          active: true,
+          auto_sync_enabled: true,
+          sync_interval_hours: 6,
+          last_synced_at: "2026-04-08T08:00:00",
+          next_sync_at: "2026-04-08T14:00:00",
+        },
+      ],
+    }),
+    ["/sources"],
+  );
+
+  render(<RouterProvider router={router} />);
+
+  await screen.findByRole("heading", { name: /discovery inputs/i });
+  await user.click(await screen.findByRole("button", { name: /show details/i }));
+
+  expect(screen.getByText("4/8/2026, 1:00:00 AM")).toBeInTheDocument();
+  expect(screen.getByText("4/8/2026, 7:00:00 AM")).toBeInTheDocument();
 });
 
 test("disables manual sync affordance for inactive sources", async () => {
@@ -610,6 +796,50 @@ test("answers live under the profile screen", async () => {
   expect(screen.getByLabelText(/prompt/i)).toBeInTheDocument();
 });
 
+test("manages application accounts from the profile screen", async () => {
+  const user = userEvent.setup();
+  const router = createMemoryAppRouter(createMockApi(), ["/role-profile?tab=application-accounts"]);
+
+  render(<RouterProvider router={router} />);
+
+  expect(await screen.findByRole("heading", { name: /centralized user profile/i })).toBeInTheDocument();
+  expect(screen.getByRole("tab", { name: /application accounts/i })).toHaveAttribute("aria-selected", "true");
+  expect(await screen.findByText(/acme.icims.com/i)).toBeInTheDocument();
+
+  await user.selectOptions(screen.getByLabelText(/^platform$/i), "jobvite");
+  await user.type(screen.getByLabelText(/employer host/i), "jobs.jobvite.com");
+  await user.type(screen.getByLabelText(/login email or username/i), "newuser@example.com");
+  await user.type(screen.getByLabelText(/^password$/i), "hunter2");
+  await user.click(screen.getByRole("button", { name: /save application account/i }));
+
+  await waitFor(() => {
+    expect(screen.getByText(/application account saved\./i)).toBeInTheDocument();
+  });
+  expect(screen.getByText(/jobs.jobvite.com/i)).toBeInTheDocument();
+
+  await user.click(screen.getAllByRole("button", { name: /^edit$/i })[0]);
+  expect(screen.getByLabelText(/login email or username/i)).toHaveAttribute(
+    "placeholder",
+    "Leave blank to keep the current login",
+  );
+  await user.clear(screen.getByLabelText(/employer host/i));
+  await user.type(screen.getByLabelText(/employer host/i), "globex.icims.com");
+  await user.type(screen.getByLabelText(/new password/i), "updated-password");
+  await user.click(screen.getByRole("button", { name: /save account changes/i }));
+
+  await waitFor(() => {
+    expect(screen.getByText(/application account updated\./i)).toBeInTheDocument();
+  });
+  expect(screen.getByText(/globex.icims.com/i)).toBeInTheDocument();
+
+  await user.click(screen.getAllByRole("button", { name: /^delete$/i })[0]);
+
+  await waitFor(() => {
+    expect(screen.queryByText(/^globex.icims.com$/i)).not.toBeInTheDocument();
+  });
+  expect(screen.getByText(/application account deleted\./i)).toBeInTheDocument();
+});
+
 test("shows action-needed runs in the operator queue", async () => {
   const router = createMemoryAppRouter(createMockApi(), ["/action-needed"]);
 
@@ -632,8 +862,10 @@ test("runs an application from the jobs screen and shows the latest status", asy
   await user.click(await screen.findByRole("button", { name: /run now/i }));
 
   await waitFor(() => {
-    expect(screen.getByText(/run finished with status submitted/i)).toBeInTheDocument();
+    expect(screen.getByText(/application sent/i)).toBeInTheDocument();
   });
+  expect(screen.getByText(/submitted through greenhouse\./i)).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: /open job/i })).toHaveAttribute("href", "/jobs/1");
   expect(screen.getByText(/^submitted$/i)).toBeInTheDocument();
 });
 
@@ -655,6 +887,11 @@ test("shows discovery-only jobs as non-runnable", async () => {
           relevance_failure_cause: null,
           relevance_decision_phase: null,
           preferred_apply_target_type: "external_link",
+          preferred_apply_target_platform_family: "lever",
+          preferred_apply_target_platform_label: "Lever",
+          preferred_apply_target_readiness_status: "manual_only",
+          preferred_apply_target_readiness_reason:
+            "Lever link is recognized, but this generic external target still needs a target upgrade before it can run automatically.",
           sighting_count: 2,
           open_question_task_count: 0,
           latest_application_run_status: null,
@@ -666,8 +903,46 @@ test("shows discovery-only jobs as non-runnable", async () => {
 
   render(<RouterProvider router={router} />);
 
-  expect(await screen.findByText(/discovery only/i)).toBeInTheDocument();
+  expect(await screen.findByText(/needs target upgrade/i)).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: /run now/i })).not.toBeInTheDocument();
+});
+
+test("shows a compact unsupported-platform note on jobs cards", async () => {
+  const router = createMemoryAppRouter(
+    createMockApi({
+      listJobs: async () => [
+        {
+          id: 1,
+          canonical_key: "acme-se-i",
+          company_name: "Acme",
+          title: "Software Engineer I",
+          location: "Remote",
+          status: "discovered",
+          relevance_decision: "match",
+          relevance_source: "ai",
+          relevance_score: 0.92,
+          relevance_summary: "Strong match.",
+          relevance_failure_cause: null,
+          relevance_decision_phase: null,
+          preferred_apply_target_type: "external_link",
+          preferred_apply_target_platform_family: "workday",
+          preferred_apply_target_platform_label: "Workday",
+          preferred_apply_target_compatibility_label: "Browser-compatible",
+          preferred_apply_target_readiness_status: "platform_not_supported",
+          preferred_apply_target_readiness_reason: "Workday is recognized but not supported yet.",
+          sighting_count: 2,
+          open_question_task_count: 0,
+          latest_application_run_status: null,
+        },
+      ],
+    }),
+    ["/jobs"],
+  );
+
+  render(<RouterProvider router={router} />);
+
+  expect(await screen.findByText(/workday not automated yet/i)).toBeInTheDocument();
+  expect(screen.queryByText(/recognized but not supported yet/i)).not.toBeInTheDocument();
 });
 
 test("updates job relevance from the jobs screen", async () => {
@@ -680,7 +955,7 @@ test("updates job relevance from the jobs screen", async () => {
   await user.click(screen.getByRole("button", { name: /exclude/i }));
 
   await waitFor(() => {
-    expect(screen.getByText(/relevance updated to reject/i)).toBeInTheDocument();
+    expect(screen.getByText(/marked as reject in the queue\./i)).toBeInTheDocument();
   });
 });
 

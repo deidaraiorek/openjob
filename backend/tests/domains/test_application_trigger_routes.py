@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 from app.domains.accounts.service import ensure_account
 from app.domains.jobs.models import ApplyTarget, Job
 
@@ -32,25 +30,23 @@ def test_trigger_application_run_uses_standard_service(
     )
     db_session.commit()
 
-    def fake_execute(session, *, account, job_id, fetch_questions=None, submit_application=None):
-        return SimpleNamespace(
-            application_run_id=41,
-            status="submitted",
-            answer_entry_ids=[7],
-            created_question_task_ids=[],
-        )
+    queued: list[tuple[int, str]] = []
 
-    monkeypatch.setattr("app.domains.applications.routes.execute_application_run", fake_execute)
+    def fake_enqueue(job_id: int, account_email: str) -> None:
+            queued.append((job_id, account_email))
+
+    monkeypatch.setattr("app.domains.applications.routes.enqueue_application_run", fake_enqueue)
 
     response = auth_client.post(f"/api/applications/jobs/{job.id}/run")
 
     assert response.status_code == 200
     assert response.json() == {
-        "application_run_id": 41,
-        "status": "submitted",
-        "answer_entry_ids": [7],
+        "application_run_id": 0,
+        "status": "queued",
+        "answer_entry_ids": [],
         "created_question_task_ids": [],
     }
+    assert queued == [(job.id, "owner@example.com")]
 
 
 def test_trigger_application_run_uses_linkedin_service(
@@ -81,25 +77,119 @@ def test_trigger_application_run_uses_linkedin_service(
     )
     db_session.commit()
 
-    def fake_execute(session, *, account, job_id, inspect_flow=None, submit_flow=None, settings=None):
-        return SimpleNamespace(
-            application_run_id=52,
-            status="cooldown_required",
-            answer_entry_ids=[],
-            created_question_task_ids=[],
-        )
+    queued: list[tuple[int, str]] = []
 
-    monkeypatch.setattr(
-        "app.domains.applications.routes.execute_linkedin_application_run",
-        fake_execute,
-    )
+    def fake_enqueue(job_id: int, account_email: str) -> None:
+            queued.append((job_id, account_email))
+
+    monkeypatch.setattr("app.domains.applications.routes.enqueue_application_run", fake_enqueue)
 
     response = auth_client.post(f"/api/applications/jobs/{job.id}/run")
 
     assert response.status_code == 200
     assert response.json() == {
-        "application_run_id": 52,
-        "status": "cooldown_required",
+        "application_run_id": 0,
+        "status": "queued",
         "answer_entry_ids": [],
         "created_question_task_ids": [],
     }
+    assert queued == [(job.id, "owner@example.com")]
+
+
+def test_trigger_application_run_rejects_platforms_that_are_not_supported_yet(
+    auth_client,
+    db_session,
+) -> None:
+    account = ensure_account(db_session, "owner@example.com")
+    job = Job(
+        account_id=account.id,
+        canonical_key="acme-workday-software-engineer",
+        company_name="Acme",
+        title="Software Engineer",
+        location="Remote",
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    db_session.add(
+        ApplyTarget(
+            job_id=job.id,
+            target_type="external_link",
+            destination_url="https://acme.wd1.myworkdaysite.com/recruiting/acme/job/123",
+            is_preferred=True,
+            metadata_json={},
+        )
+    )
+    db_session.commit()
+
+    response = auth_client.post(f"/api/applications/jobs/{job.id}/run")
+
+    assert response.status_code == 422
+    assert "Workday link is recognized" in response.json()["detail"]
+
+
+def test_trigger_application_run_rejects_recognized_external_links_until_upgraded(
+    auth_client,
+    db_session,
+) -> None:
+    account = ensure_account(db_session, "owner@example.com")
+    job = Job(
+        account_id=account.id,
+        canonical_key="acme-lever-external-link",
+        company_name="Acme",
+        title="Software Engineer",
+        location="Remote",
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    db_session.add(
+        ApplyTarget(
+            job_id=job.id,
+            target_type="external_link",
+            destination_url="https://jobs.lever.co/acme/lever-123/apply",
+            is_preferred=True,
+            metadata_json={"origin": "github_curated"},
+        )
+    )
+    db_session.commit()
+
+    response = auth_client.post(f"/api/applications/jobs/{job.id}/run")
+
+    assert response.status_code == 422
+    assert "generic external target still needs a target upgrade" in response.json()["detail"]
+
+
+def test_trigger_application_run_requires_application_accounts_when_target_demands_it(
+    auth_client,
+    db_session,
+) -> None:
+    account = ensure_account(db_session, "owner@example.com")
+    job = Job(
+        account_id=account.id,
+        canonical_key="acme-linkedin-account-required",
+        company_name="Acme",
+        title="Software Engineer",
+        location="Remote",
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    db_session.add(
+        ApplyTarget(
+            job_id=job.id,
+            target_type="linkedin_easy_apply",
+            destination_url="https://www.linkedin.com/jobs/view/123",
+            is_preferred=True,
+            metadata_json={"linkedin_job_id": "123", "credential_policy": "tenant_required"},
+        )
+    )
+    db_session.commit()
+
+    response = auth_client.post(f"/api/applications/jobs/{job.id}/run")
+
+    assert response.status_code == 422
+    assert "Add an application account for LinkedIn" in response.json()["detail"]

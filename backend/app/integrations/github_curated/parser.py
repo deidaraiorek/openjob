@@ -29,6 +29,43 @@ def _strip_html(value: str) -> str:
     return " ".join(unescape(without_tags).split())
 
 
+def _extract_markdown_links(value: str) -> list[dict[str, str | None]]:
+    return [
+        {"label": match.group(1).strip(), "url": match.group(2).strip()}
+        for match in LINK_PATTERN.finditer(value)
+        if match.group(2).strip()
+    ]
+
+
+def _extract_html_links(value: str) -> list[dict[str, str | None]]:
+    return [
+        {"label": _strip_html(match.group(2)) or None, "url": match.group(1).strip()}
+        for match in HTML_LINK_PATTERN.finditer(value)
+        if match.group(1).strip()
+    ]
+
+
+def _build_outbound_links(*, company_cell: str, listing_cell: str, apply_cell: str, extra_cells: list[str] | None = None) -> list[dict[str, str | None]]:
+    links: list[dict[str, str | None]] = []
+    seen: set[str] = set()
+
+    def add(kind: str, cell: str) -> None:
+        cell_links = _extract_html_links(cell) or _extract_markdown_links(cell)
+        for link in cell_links:
+            url = link["url"]
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            links.append({"kind": kind, "label": link["label"], "url": url})
+
+    add("company", company_cell)
+    add("listing", listing_cell)
+    add("apply", apply_cell)
+    for extra_cell in extra_cells or []:
+        add("other", extra_cell)
+    return links
+
+
 def _parse_markdown_rows(markdown: str) -> list[DiscoveryCandidate]:
     records: list[DiscoveryCandidate] = []
 
@@ -58,7 +95,15 @@ def _parse_markdown_rows(markdown: str) -> list[DiscoveryCandidate]:
                 listing_url=listing_url or company_url or apply_url or "",
                 apply_url=apply_url,
                 apply_target_type="external_link",
-                raw_payload={"row": parts},
+                raw_payload={
+                    "row": parts,
+                    "outbound_links": _build_outbound_links(
+                        company_cell=parts[0],
+                        listing_cell=parts[1],
+                        apply_cell=parts[3],
+                        extra_cells=parts[4:],
+                    ),
+                },
                 metadata={"origin": "github_curated"},
             ),
         )
@@ -98,7 +143,15 @@ def _parse_html_rows(markdown: str) -> list[DiscoveryCandidate]:
                 listing_url=apply_url,
                 apply_url=apply_url,
                 apply_target_type="external_link",
-                raw_payload={"row_html": row_html},
+                raw_payload={
+                    "row_html": row_html,
+                    "outbound_links": _build_outbound_links(
+                        company_cell=parts[0],
+                        listing_cell=parts[1],
+                        apply_cell=parts[3],
+                        extra_cells=parts[4:],
+                    ),
+                },
                 metadata={"origin": "github_curated"},
             ),
         )

@@ -5,12 +5,14 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app.domains.application_accounts.service import TargetReadiness, resolve_target_readiness
 from app.domains.accounts.dependencies import get_current_account
 from app.domains.accounts.models import Account
-from app.domains.jobs.models import ApplyTarget, Job, JobRelevanceEvaluation, JobRelevanceTask, JobSighting
 from app.domains.jobs.relevance import apply_relevance_result
+from app.domains.jobs.models import ApplyTarget, Job, JobRelevanceEvaluation, JobRelevanceTask, JobSighting
 from app.domains.questions.models import QuestionTask
 from app.domains.applications.models import ApplicationEvent, ApplicationRun
+from app.domains.sources.link_classification import compatibility_label, compatibility_state_for
 from app.integrations.openai.job_relevance import JobRelevanceResult
 from app.tasks.job_relevance import rescore_job
 from app.db.session import get_db_session
@@ -18,12 +20,21 @@ from app.db.session import get_db_session
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
+class OutboundLinkResponse(BaseModel):
+    kind: str
+    label: str | None
+    url: str
+
+
 class JobSightingResponse(BaseModel):
     id: int
     source_id: int | None
+    source_name: str | None
+    source_type: str | None
     external_job_id: str | None
     listing_url: str
     apply_url: str | None
+    outbound_links: list[OutboundLinkResponse]
 
 
 class ApplyTargetResponse(BaseModel):
@@ -31,6 +42,18 @@ class ApplyTargetResponse(BaseModel):
     target_type: str
     destination_url: str
     is_preferred: bool
+    source_url: str | None
+    resolved_destination_url: str | None
+    platform_family: str
+    platform_label: str
+    driver_family: str
+    compatibility_state: str
+    compatibility_label: str
+    compatibility_reason: str | None
+    credential_policy: str
+    readiness_status: str
+    readiness_reason: str | None
+    tenant_host: str
 
 
 class QuestionTaskSummary(BaseModel):
@@ -123,6 +146,7 @@ class JobDetailResponse(BaseModel):
     pending_relevance_failure_cause: str | None = None
     pending_relevance_next_retry_at: str | None = None
     sightings: list[JobSightingResponse]
+    apply_targets: list[ApplyTargetResponse]
     preferred_apply_target: ApplyTargetResponse | None
     question_tasks: list[QuestionTaskSummary]
     application_runs: list[ApplicationRunResponse]
@@ -148,27 +172,65 @@ class JobListItemResponse(BaseModel):
     pending_relevance_failure_cause: str | None = None
     pending_relevance_next_retry_at: str | None = None
     preferred_apply_target_type: str | None
+    preferred_apply_target_platform_family: str | None
+    preferred_apply_target_platform_label: str | None
+    preferred_apply_target_driver_family: str | None
+    preferred_apply_target_compatibility_state: str | None
+    preferred_apply_target_compatibility_label: str | None
+    preferred_apply_target_compatibility_reason: str | None
+    preferred_apply_target_credential_policy: str | None
+    preferred_apply_target_readiness_status: str | None
+    preferred_apply_target_readiness_reason: str | None
     sighting_count: int
     open_question_task_count: int
     latest_application_run_status: str | None
 
 
 def serialize_sighting(sighting: JobSighting) -> JobSightingResponse:
+    outbound_links = [
+        OutboundLinkResponse(
+            kind=str(item.get("kind") or "unknown"),
+            label=str(item["label"]) if isinstance(item.get("label"), str) else None,
+            url=str(item["url"]),
+        )
+        for item in sighting.raw_payload.get("outbound_links", [])
+        if isinstance(item, dict) and isinstance(item.get("url"), str)
+    ]
     return JobSightingResponse(
         id=sighting.id,
         source_id=sighting.source_id,
+        source_name=sighting.source.name if sighting.source else None,
+        source_type=sighting.source.source_type if sighting.source else None,
         external_job_id=sighting.external_job_id,
         listing_url=sighting.listing_url,
         apply_url=sighting.apply_url,
+        outbound_links=outbound_links,
     )
 
 
-def serialize_apply_target(target: ApplyTarget) -> ApplyTargetResponse:
+def serialize_apply_target(target: ApplyTarget, readiness: TargetReadiness) -> ApplyTargetResponse:
+    compatibility_state = compatibility_state_for(
+        destination_url=target.destination_url,
+        target_type=target.target_type,
+        metadata=target.metadata_json,
+    )
     return ApplyTargetResponse(
         id=target.id,
         target_type=target.target_type,
         destination_url=target.destination_url,
         is_preferred=target.is_preferred,
+        source_url=target.metadata_json.get("source_url"),
+        resolved_destination_url=target.metadata_json.get("resolved_destination_url"),
+        platform_family=readiness.platform_family,
+        platform_label=readiness.platform_label,
+        driver_family=readiness.driver_family,
+        compatibility_state=compatibility_state,
+        compatibility_label=compatibility_label(compatibility_state),
+        compatibility_reason=target.metadata_json.get("compatibility_reason"),
+        credential_policy=readiness.credential_policy,
+        readiness_status=readiness.status,
+        readiness_reason=readiness.reason,
+        tenant_host=readiness.tenant_host,
     )
 
 
@@ -293,7 +355,7 @@ def list_jobs(
         select(Job)
         .where(Job.account_id == current_account.id)
         .options(
-            selectinload(Job.sightings),
+            selectinload(Job.sightings).selectinload(JobSighting.source),
             selectinload(Job.apply_targets),
             selectinload(Job.question_tasks),
             selectinload(Job.application_runs),
@@ -317,6 +379,11 @@ def list_jobs(
             (target for target in job.apply_targets if target.is_preferred),
             None,
         )
+        preferred_target_readiness = (
+            resolve_target_readiness(session, account_id=current_account.id, target=preferred_target)
+            if preferred_target is not None
+            else None
+        )
         latest_run = max(job.application_runs, key=lambda item: item.id, default=None)
         items.append(
             JobListItemResponse(
@@ -338,6 +405,47 @@ def list_jobs(
                 pending_relevance_failure_cause=pending_task.last_failure_cause if pending_task else None,
                 pending_relevance_next_retry_at=pending_task.available_at.isoformat() if pending_task else None,
                 preferred_apply_target_type=preferred_target.target_type if preferred_target else None,
+                preferred_apply_target_platform_family=(
+                    preferred_target_readiness.platform_family if preferred_target_readiness else None
+                ),
+                preferred_apply_target_platform_label=(
+                    preferred_target_readiness.platform_label if preferred_target_readiness else None
+                ),
+                preferred_apply_target_driver_family=(
+                    preferred_target_readiness.driver_family if preferred_target_readiness else None
+                ),
+                preferred_apply_target_compatibility_state=(
+                    compatibility_state_for(
+                        destination_url=preferred_target.destination_url,
+                        target_type=preferred_target.target_type,
+                        metadata=preferred_target.metadata_json,
+                    )
+                    if preferred_target is not None
+                    else None
+                ),
+                preferred_apply_target_compatibility_label=(
+                    compatibility_label(
+                        compatibility_state_for(
+                            destination_url=preferred_target.destination_url,
+                            target_type=preferred_target.target_type,
+                            metadata=preferred_target.metadata_json,
+                        )
+                    )
+                    if preferred_target is not None
+                    else None
+                ),
+                preferred_apply_target_compatibility_reason=(
+                    preferred_target.metadata_json.get("compatibility_reason") if preferred_target else None
+                ),
+                preferred_apply_target_credential_policy=(
+                    preferred_target_readiness.credential_policy if preferred_target_readiness else None
+                ),
+                preferred_apply_target_readiness_status=(
+                    preferred_target_readiness.status if preferred_target_readiness else None
+                ),
+                preferred_apply_target_readiness_reason=(
+                    preferred_target_readiness.reason if preferred_target_readiness else None
+                ),
                 sighting_count=len(job.sightings),
                 open_question_task_count=len(
                     [task for task in job.question_tasks if task.status in {"new", "pending"}]
@@ -452,7 +560,7 @@ def get_job_detail(
         select(Job)
         .where(Job.id == job_id, Job.account_id == current_account.id)
         .options(
-            selectinload(Job.sightings),
+            selectinload(Job.sightings).selectinload(JobSighting.source),
             selectinload(Job.apply_targets),
             selectinload(Job.question_tasks),
             selectinload(Job.application_runs).selectinload(ApplicationRun.events),
@@ -466,6 +574,11 @@ def get_job_detail(
     preferred_target = next(
         (target for target in job.apply_targets if target.is_preferred),
         None,
+    )
+    preferred_target_readiness = (
+        resolve_target_readiness(session, account_id=current_account.id, target=preferred_target)
+        if preferred_target is not None
+        else None
     )
     pending_task = effective_pending_relevance_task(job)
 
@@ -488,7 +601,18 @@ def get_job_detail(
         pending_relevance_failure_cause=pending_task.last_failure_cause if pending_task else None,
         pending_relevance_next_retry_at=pending_task.available_at.isoformat() if pending_task else None,
         sightings=[serialize_sighting(sighting) for sighting in sorted(job.sightings, key=lambda item: item.id)],
-        preferred_apply_target=serialize_apply_target(preferred_target) if preferred_target else None,
+        apply_targets=[
+            serialize_apply_target(
+                target,
+                resolve_target_readiness(session, account_id=current_account.id, target=target),
+            )
+            for target in sorted(job.apply_targets, key=lambda item: (not item.is_preferred, item.id))
+        ],
+        preferred_apply_target=(
+            serialize_apply_target(preferred_target, preferred_target_readiness)
+            if preferred_target is not None and preferred_target_readiness is not None
+            else None
+        ),
         question_tasks=[
             serialize_question_summary(task)
             for task in sorted(job.question_tasks, key=lambda item: item.id)

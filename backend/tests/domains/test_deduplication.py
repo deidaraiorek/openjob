@@ -1,7 +1,7 @@
 from sqlalchemy import func, select
 
 from app.domains.accounts.service import ensure_account
-from app.domains.jobs.deduplication import DiscoveryCandidate, ingest_candidate
+from app.domains.jobs.deduplication import ApplyTargetCandidate, DiscoveryCandidate, ingest_candidate
 from app.domains.jobs.models import ApplyTarget, Job, JobSighting
 from app.domains.sources.models import JobSource
 
@@ -38,6 +38,26 @@ def test_cross_source_duplicates_collapse_to_one_job_and_prefer_direct_ats(db_se
         apply_url="https://boards.greenhouse.io/acme/jobs/123",
         apply_target_type="external_link",
         external_job_id="github-acme-se1",
+        apply_targets=[
+            ApplyTargetCandidate(
+                destination_url="https://simplify.jobs/jobs/acme-se1",
+                target_type="external_link",
+                metadata={
+                    "source_url": "https://simplify.jobs/jobs/acme-se1",
+                    "compatibility_state": "manual_only",
+                },
+            ),
+            ApplyTargetCandidate(
+                destination_url="https://boards.greenhouse.io/acme/jobs/123",
+                target_type="greenhouse_apply",
+                metadata={
+                    "source_url": "https://boards.greenhouse.io/acme/jobs/123",
+                    "compatibility_state": "api_compatible",
+                    "board_token": "acme",
+                    "job_post_id": "123",
+                },
+            ),
+        ],
     )
     greenhouse_candidate = DiscoveryCandidate(
         source_type="greenhouse_board",
@@ -48,6 +68,7 @@ def test_cross_source_duplicates_collapse_to_one_job_and_prefer_direct_ats(db_se
         apply_url="https://boards.greenhouse.io/acme/jobs/123",
         apply_target_type="greenhouse_apply",
         external_job_id="123",
+        metadata={"board_token": "acme", "job_post_id": "123", "compatibility_state": "api_compatible"},
     )
 
     ingest_candidate(db_session, account, github_source, github_candidate)
@@ -68,6 +89,10 @@ def test_cross_source_duplicates_collapse_to_one_job_and_prefer_direct_ats(db_se
     ]
     preferred_target = next(target for target in targets if target.is_preferred)
     assert preferred_target.target_type == "greenhouse_apply"
+    assert {target.destination_url for target in targets} == {
+        "https://simplify.jobs/jobs/acme-se1",
+        "https://boards.greenhouse.io/acme/jobs/123",
+    }
 
 
 def test_cross_source_duplicates_collapse_when_urls_normalize_to_same_job_key(db_session) -> None:
@@ -104,14 +129,19 @@ def test_cross_source_duplicates_collapse_when_urls_normalize_to_same_job_key(db
         external_job_id="simplify-weride-se",
     )
     direct_candidate = DiscoveryCandidate(
-        source_type="lever",
+        source_type="lever_postings",
         company_name="WeRide",
         title="Software Engineer",
         location="Remote",
         listing_url="https://jobs.lever.co/weride/1dc0209a-f90b-4f1c-a614-75f5b7883e6d/",
         apply_url="https://jobs.lever.co/weride/1dc0209a-f90b-4f1c-a614-75f5b7883e6d/apply",
-        apply_target_type="external_link",
+        apply_target_type="lever_apply",
         external_job_id="1dc0209a-f90b-4f1c-a614-75f5b7883e6d",
+        metadata={
+            "company_slug": "weride",
+            "posting_id": "1dc0209a-f90b-4f1c-a614-75f5b7883e6d",
+            "compatibility_state": "api_compatible",
+        },
     )
 
     first_job, _ = ingest_candidate(db_session, account, simplify_source, simplify_candidate)

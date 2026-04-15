@@ -1,3 +1,4 @@
+import os
 import threading
 
 from fastapi import FastAPI
@@ -8,6 +9,7 @@ from app.api.routes.auth import router as auth_router
 from app.api.routes.health import router as health_router
 from app.config import get_settings
 import app.db.models  # noqa: F401
+from app.domains.application_accounts.routes import router as application_accounts_router
 from app.domains.answers.routes import router as answers_router
 from app.domains.applications.routes import router as applications_router
 from app.domains.jobs.routes import router as jobs_router
@@ -26,6 +28,7 @@ def ensure_database_ready() -> None:
     existing_tables = set(inspector.get_table_names())
     required_tables = {
         "accounts",
+        "application_accounts",
         "job_sources",
         "jobs",
         "job_sightings",
@@ -64,6 +67,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router, prefix="/api")
     app.include_router(sources_router, prefix="/api")
     app.include_router(role_profile_router, prefix="/api")
+    app.include_router(application_accounts_router, prefix="/api")
     app.include_router(answers_router, prefix="/api")
     app.include_router(questions_router, prefix="/api")
     app.include_router(jobs_router, prefix="/api")
@@ -71,6 +75,8 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     def _resume_pending_relevance() -> None:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return
         threading.Thread(target=drain_all_relevance_tasks, daemon=True).start()
 
     return app

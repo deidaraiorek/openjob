@@ -3,14 +3,15 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.domains.accounts.models import Account
+from app.domains.jobs.apply_target_candidate import ApplyTargetCandidate
 from app.domains.jobs.models import ApplyTarget, Job, JobSighting
-from app.domains.jobs.target_resolution import refresh_preferred_apply_target
+from app.domains.jobs.target_resolution import get_target_priority_values, refresh_preferred_apply_target
 from app.domains.sources.models import JobSource
 
 
@@ -26,6 +27,26 @@ class DiscoveryCandidate:
     apply_target_type: str | None = None
     raw_payload: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    apply_targets: list[ApplyTargetCandidate] = field(default_factory=list)
+
+
+_TRACKING_PARAMS = frozenset({
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "ref", "referer", "referrer",
+})
+
+
+def strip_tracking_params(value: str | None) -> str | None:
+    if not value:
+        return value
+    parsed = urlparse(value)
+    clean_pairs = [
+        (k, v)
+        for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+        if k.lower() not in _TRACKING_PARAMS
+    ]
+    cleaned = parsed._replace(query=urlencode(clean_pairs), fragment="")
+    return cleaned.geturl()
 
 
 def normalize_text(value: str | None) -> str:
@@ -209,9 +230,9 @@ def _upsert_sighting(
 
     if existing_sighting:
         existing_sighting.normalized_url = normalized_candidate_url
-        existing_sighting.listing_url = candidate.listing_url
-        existing_sighting.apply_url = candidate.apply_url
-        existing_sighting.raw_payload = candidate.raw_payload
+        existing_sighting.listing_url = strip_tracking_params(candidate.listing_url)
+        existing_sighting.apply_url = strip_tracking_params(candidate.apply_url)
+        existing_sighting.raw_payload = _compact_sighting_payload(candidate.raw_payload)
         existing_sighting.external_job_id = candidate.external_job_id
         return
 
@@ -221,33 +242,132 @@ def _upsert_sighting(
             source=source,
             external_job_id=candidate.external_job_id,
             normalized_url=normalized_candidate_url,
-            listing_url=candidate.listing_url,
-            apply_url=candidate.apply_url,
-            raw_payload=candidate.raw_payload,
+            listing_url=strip_tracking_params(candidate.listing_url),
+            apply_url=strip_tracking_params(candidate.apply_url),
+            raw_payload=_compact_sighting_payload(candidate.raw_payload),
         ),
     )
 
 
 def _upsert_apply_target(session: Session, job: Job, candidate: DiscoveryCandidate) -> None:
-    if not candidate.apply_url or not candidate.apply_target_type:
-        return
+    target_candidates = list(candidate.apply_targets)
+    if not target_candidates and candidate.apply_url and candidate.apply_target_type:
+        target_candidates.append(
+            ApplyTargetCandidate(
+                destination_url=candidate.apply_url,
+                target_type=candidate.apply_target_type,
+                metadata=candidate.metadata,
+            )
+        )
+
+    for target_candidate in target_candidates:
+        if not target_candidate.destination_url or not target_candidate.target_type:
+            continue
+
+        existing_target = _find_existing_apply_target(job, target_candidate)
+        if existing_target is not None:
+            _merge_apply_target(existing_target, target_candidate)
+            continue
+
+        session.add(
+            ApplyTarget(
+                job=job,
+                target_type=target_candidate.target_type,
+                destination_url=strip_tracking_params(target_candidate.destination_url),
+                metadata_json=target_candidate.metadata,
+            ),
+        )
+
+
+def _find_existing_apply_target(job: Job, candidate: ApplyTargetCandidate) -> ApplyTarget | None:
+    candidate_destination = normalize_url(candidate.destination_url)
+    candidate_source = normalize_url(_target_source_url(candidate.metadata))
+    candidate_resolved = normalize_url(_target_resolved_url(candidate.destination_url, candidate.metadata))
 
     for target in job.apply_targets:
-        if (
-            target.destination_url == candidate.apply_url
-            and target.target_type == candidate.apply_target_type
-        ):
-            target.metadata_json = candidate.metadata
-            return
+        existing_destination = normalize_url(target.destination_url)
+        existing_source = normalize_url(_target_source_url(target.metadata_json))
+        existing_resolved = normalize_url(_target_resolved_url(target.destination_url, target.metadata_json))
+        if candidate_destination and existing_destination == candidate_destination:
+            return target
+        if candidate_source and existing_source == candidate_source:
+            return target
+        if candidate_resolved and existing_resolved == candidate_resolved:
+            return target
+    return None
 
-    session.add(
-        ApplyTarget(
-            job=job,
-            target_type=candidate.apply_target_type,
-            destination_url=candidate.apply_url,
-            metadata_json=candidate.metadata,
-        ),
+
+def _merge_apply_target(target: ApplyTarget, candidate: ApplyTargetCandidate) -> None:
+    existing_priority = get_target_priority_values(
+        destination_url=target.destination_url,
+        target_type=target.target_type,
+        metadata=target.metadata_json,
     )
+    candidate_priority = get_target_priority_values(
+        destination_url=candidate.destination_url,
+        target_type=candidate.target_type,
+        metadata=candidate.metadata,
+    )
+
+    if candidate_priority >= existing_priority:
+        target.target_type = candidate.target_type
+        target.destination_url = strip_tracking_params(candidate.destination_url)
+
+    target.metadata_json = _merge_target_metadata(target.metadata_json, candidate.metadata)
+
+
+def _merge_target_metadata(existing: dict[str, Any] | None, new: dict[str, Any] | None) -> dict[str, Any]:
+    existing = dict(existing or {})
+    new = dict(new or {})
+    merged: dict[str, Any] = {**existing, **new}
+    source_url = _first_string(existing.get("source_url"), new.get("source_url"))
+    if source_url:
+        merged["source_url"] = source_url
+    else:
+        merged.pop("source_url", None)
+
+    merged.pop("source_urls", None)
+    merged.pop("provenance_links", None)
+    merged.pop("compatibility_notes", None)
+    return merged
+
+
+def _first_string(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, str):
+            candidate = value.strip()
+            if candidate:
+                return candidate
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    return item.strip()
+    return None
+
+
+def _compact_sighting_payload(raw_payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(raw_payload, dict):
+        return {}
+    compacted = dict(raw_payload)
+    compacted.pop("outbound_links", None)
+    return compacted
+
+
+def _target_source_url(metadata: dict[str, Any] | None) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+    source_url = metadata.get("source_url")
+    if isinstance(source_url, str) and source_url.strip():
+        return source_url
+    return None
+
+
+def _target_resolved_url(destination_url: str, metadata: dict[str, Any] | None) -> str:
+    if isinstance(metadata, dict):
+        resolved = metadata.get("resolved_destination_url")
+        if isinstance(resolved, str) and resolved.strip():
+            return resolved
+    return destination_url
 
 
 def ingest_candidate(

@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 
 import { useAppContext } from "../app/layout";
-import type { AnswerEntry, QuestionTask } from "../lib/api";
+import type { AnswerEntry, QuestionAlias, QuestionTask } from "../lib/api";
 
 function normalizeFieldType(task: QuestionTask) {
   return task.field_type.toLowerCase();
@@ -79,29 +80,38 @@ function compatibleAnswersForTask(task: QuestionTask, answers: AnswerEntry[]) {
 
 export function QuestionsRoute() {
   const { api } = useAppContext();
+  const [searchParams] = useSearchParams();
+  const jobIdParam = searchParams.get("job_id");
+  const jobId = jobIdParam ? Number(jobIdParam) : undefined;
   const [tasks, setTasks] = useState<QuestionTask[]>([]);
   const [answers, setAnswers] = useState<AnswerEntry[]>([]);
+  const [aliases, setAliases] = useState<QuestionAlias[]>([]);
   const [selectedExistingAnswerIds, setSelectedExistingAnswerIds] = useState<Record<number, number | null>>({});
   const [draftLabels, setDraftLabels] = useState<Record<number, string>>({});
   const [draftTexts, setDraftTexts] = useState<Record<number, string>>({});
   const [draftSingleValues, setDraftSingleValues] = useState<Record<number, string>>({});
   const [draftMultiValues, setDraftMultiValues] = useState<Record<number, string[]>>({});
   const [draftFiles, setDraftFiles] = useState<Record<number, File | null>>({});
+  const [rankedModeTaskIds, setRankedModeTaskIds] = useState<Set<number>>(new Set());
+  const [draftRankedOrders, setDraftRankedOrders] = useState<Record<number, string[]>>({});
   const [savingTaskId, setSavingTaskId] = useState<number | null>(null);
+  const [savingAliasId, setSavingAliasId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   async function reloadData() {
-    const [taskList, answerList] = await Promise.all([
-      api.listQuestionTasks(),
+    const [taskList, answerList, aliasList] = await Promise.all([
+      api.listQuestionTasks(jobId),
       api.listAnswers(),
+      api.listQuestionAliases("suggested"),
     ]);
     setTasks(taskList);
     setAnswers(answerList);
+    setAliases(aliasList);
   }
 
   useEffect(() => {
     void reloadData();
-  }, [api]);
+  }, [api, jobId]);
 
   async function resolveTask(taskId: number, answerEntryId: number) {
     setError(null);
@@ -110,6 +120,63 @@ export function QuestionsRoute() {
       linked_answer_entry_id: answerEntryId,
     });
     await reloadData();
+  }
+
+  function toggleRankedMode(taskId: number, options: string[]) {
+    setRankedModeTaskIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(taskId)) {
+        next.delete(taskId);
+      } else {
+        next.add(taskId);
+        setDraftRankedOrders((current) => ({
+          ...current,
+          [taskId]: current[taskId] ?? [...options],
+        }));
+      }
+      return next;
+    });
+  }
+
+  function moveRankedOption(taskId: number, fromIndex: number, toIndex: number) {
+    setDraftRankedOrders((current) => {
+      const list = [...(current[taskId] ?? [])];
+      const [item] = list.splice(fromIndex, 1);
+      list.splice(toIndex, 0, item);
+      return { ...current, [taskId]: list };
+    });
+  }
+
+  async function saveRankedPreference(task: QuestionTask) {
+    const rankedOptions = draftRankedOrders[task.id] ?? task.option_labels;
+    const label = (draftLabels[task.id] ?? task.prompt_text).trim();
+    setError(null);
+    setSavingTaskId(task.id);
+    try {
+      const answer = await api.createAnswer({
+        question_template_id: task.question_template_id,
+        label,
+        answer_text: rankedOptions[0] ?? null,
+        answer_payload: { ranked_options: rankedOptions },
+      });
+      await resolveTask(task.id, answer.id);
+      setRankedModeTaskIds((prev) => { const next = new Set(prev); next.delete(task.id); return next; });
+      setDraftRankedOrders((current) => { const next = { ...current }; delete next[task.id]; return next; });
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : `Unable to save ranked preference for "${task.prompt_text}".`);
+    } finally {
+      setSavingTaskId(null);
+    }
+  }
+
+  async function respondToAlias(aliasId: number, decision: "approved" | "rejected") {
+    setSavingAliasId(aliasId);
+    try {
+      await api.updateQuestionAlias(aliasId, decision);
+      await reloadData();
+    } finally {
+      setSavingAliasId(null);
+    }
   }
 
   function clearSelectedExistingAnswer(taskId: number) {
@@ -263,9 +330,11 @@ export function QuestionsRoute() {
         <div className="panel-header">
           <div>
             <p className="eyebrow">Questions</p>
-            <h1>Resolve unknown prompts</h1>
+            <h1>{jobId ? `Questions for job #${jobId}` : "Resolve unknown prompts"}</h1>
             <p className="supporting-copy">
-              Anything missing from your memory lands here so the system can learn it once and stop flagging it as new.
+              {jobId
+                ? "Answer the questions blocking this application. Answers are saved and reused automatically."
+                : "Anything missing from your memory lands here so the system can learn it once and stop flagging it as new."}
             </p>
           </div>
         </div>
@@ -429,30 +498,66 @@ export function QuestionsRoute() {
                             })}
                           </fieldset>
                         ) : isSingleSelectField(task) && task.option_labels.length > 0 ? (
-                          <label className="question-select-shell">
-                            <span className="sr-only">New answer choice for task {task.id}</span>
-                            <select
-                              aria-label={`New answer choice for task ${task.id}`}
-                              className="question-answer-select"
-                              value={draftSingleValues[task.id] ?? ""}
-                              onChange={(event) =>
-                                {
+                          <>
+                            <label className="question-select-shell">
+                              <span className="sr-only">New answer choice for task {task.id}</span>
+                              <select
+                                aria-label={`New answer choice for task ${task.id}`}
+                                className="question-answer-select"
+                                value={draftSingleValues[task.id] ?? ""}
+                                disabled={rankedModeTaskIds.has(task.id)}
+                                onChange={(event) => {
                                   clearSelectedExistingAnswer(task.id);
                                   setDraftSingleValues((current) => ({
                                     ...current,
                                     [task.id]: event.target.value,
                                   }));
-                                }
-                              }
-                            >
-                              <option value="">Choose one option</option>
-                              {task.option_labels.map((optionLabel) => (
-                                <option key={optionLabel} value={optionLabel}>
-                                  {optionLabel}
-                                </option>
-                              ))}
-                            </select>
-                          </label>
+                                }}
+                              >
+                                <option value="">Choose one option</option>
+                                {task.option_labels.map((optionLabel) => (
+                                  <option key={optionLabel} value={optionLabel}>
+                                    {optionLabel}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                            <label className="question-choice-pill">
+                              <input
+                                type="checkbox"
+                                checked={rankedModeTaskIds.has(task.id)}
+                                onChange={() => toggleRankedMode(task.id, task.option_labels)}
+                              />
+                              <span>Save as ranked preference</span>
+                            </label>
+                            {rankedModeTaskIds.has(task.id) ? (
+                              <div className="ranked-preference-editor">
+                                <p className="muted-copy">Drag to rank your preferred options. The system will pick the highest-ranked option available in each job.</p>
+                                <ol className="ranked-option-list">
+                                  {(draftRankedOrders[task.id] ?? task.option_labels).map((opt, idx, arr) => (
+                                    <li key={opt} className="ranked-option-item">
+                                      <span className="ranked-option-rank">{idx + 1}</span>
+                                      <span className="ranked-option-label">{opt}</span>
+                                      <span className="ranked-option-controls">
+                                        <button
+                                          type="button"
+                                          aria-label={`Move ${opt} up`}
+                                          disabled={idx === 0}
+                                          onClick={() => moveRankedOption(task.id, idx, idx - 1)}
+                                        >↑</button>
+                                        <button
+                                          type="button"
+                                          aria-label={`Move ${opt} down`}
+                                          disabled={idx === arr.length - 1}
+                                          onClick={() => moveRankedOption(task.id, idx, idx + 1)}
+                                        >↓</button>
+                                      </span>
+                                    </li>
+                                  ))}
+                                </ol>
+                              </div>
+                            ) : null}
+                          </>
                         ) : (
                           <textarea
                             aria-label={`New answer text for task ${task.id}`}
@@ -475,9 +580,9 @@ export function QuestionsRoute() {
                           type="button"
                           className="secondary-button"
                           disabled={savingTaskId === task.id}
-                          onClick={() => void createAndLinkAnswer(task)}
+                          onClick={() => rankedModeTaskIds.has(task.id) ? void saveRankedPreference(task) : void createAndLinkAnswer(task)}
                         >
-                          {savingTaskId === task.id ? "Saving..." : "Save and link"}
+                          {savingTaskId === task.id ? "Saving..." : rankedModeTaskIds.has(task.id) ? "Save ranked preference" : "Save and link"}
                         </button>
                       </div>
                     </>
@@ -489,6 +594,49 @@ export function QuestionsRoute() {
           </ul>
         )}
       </section>
+
+      {aliases.length > 0 ? (
+        <section className="panel-card">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Suggestions</p>
+              <h2>Similar questions detected</h2>
+              <p className="supporting-copy">
+                These questions look like they might mean the same thing. Approve to reuse the same answer automatically.
+              </p>
+            </div>
+          </div>
+          <ul className="stack-list">
+            {aliases.map((alias) => (
+              <li key={alias.id} className="question-task-card">
+                <div>
+                  <strong>{alias.source_prompt}</strong>
+                  <span className="muted-copy"> looks similar to </span>
+                  <strong>{alias.canonical_prompt}</strong>
+                </div>
+                <div className="question-task-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={savingAliasId === alias.id}
+                    onClick={() => void respondToAlias(alias.id, "approved")}
+                  >
+                    {savingAliasId === alias.id ? "Saving..." : "Treat as same question"}
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    disabled={savingAliasId === alias.id}
+                    onClick={() => void respondToAlias(alias.id, "rejected")}
+                  >
+                    Ignore
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
     </main>
   );
 }

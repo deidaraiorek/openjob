@@ -133,10 +133,7 @@ def _handle_pending_task_failure(
         session.flush()
         return False
 
-    if (
-        failure_cause == "provider_response_invalid"
-        and task.attempt_count < settings.relevance_invalid_response_review_threshold
-    ):
+    if failure_cause == "provider_response_invalid":
         task.available_at = _next_retry_time(attempt_count=task.attempt_count)
         mark_job_pending(task.job, phase=task.phase, summary=pending_summary_for_phase(task.phase))
         session.flush()

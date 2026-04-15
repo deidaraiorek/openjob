@@ -68,6 +68,8 @@ def test_portal_list_routes_return_jobs_answers_and_question_tasks(auth_client, 
     assert jobs_response.status_code == 200
     assert jobs_response.json()[0]["company_name"] == "Acme"
     assert jobs_response.json()[0]["preferred_apply_target_type"] == "greenhouse_apply"
+    assert jobs_response.json()[0]["preferred_apply_target_platform_family"] == "greenhouse"
+    assert jobs_response.json()[0]["preferred_apply_target_readiness_status"] == "ready"
     assert jobs_response.json()[0]["open_question_task_count"] == 1
     assert jobs_response.json()[0]["latest_application_run_status"] == "submitted"
 

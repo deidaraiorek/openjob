@@ -27,6 +27,7 @@ class JobSource(TimestampMixin, Base):
     auto_sync_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     sync_interval_hours: Mapped[int] = mapped_column(Integer, default=6)
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_sync_summary_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     next_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     sync_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 

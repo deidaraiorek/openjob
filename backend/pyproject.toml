@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
   "alembic>=1.16.0",
   "celery[redis]>=5.5.0",
+  "cryptography>=45.0.0",
   "email-validator>=2.2.0",
   "fastapi>=0.116.0",
   "itsdangerous>=2.2.0",
@@ -25,6 +26,12 @@ dependencies = [
 dev = [
   "httpx>=0.28.0",
   "pytest>=8.4.0",
+]
+browser = [
+  "playwright>=1.40",
+  "browser-use>=0.1.40",
+  "langchain-groq>=0.3.0",
+  "langchain-openai>=0.3.0",
 ]
 
 [tool.setuptools]

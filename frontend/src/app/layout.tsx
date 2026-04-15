@@ -15,7 +15,27 @@ type AppLayoutProps = {
 export type AppContext = {
   api: AppApi;
   session: SessionResponse;
+  timezone: string;
+  setTimezone: (value: string) => void;
 };
+
+const TIMEZONE_STORAGE_KEY = "openjob.portal.timezone";
+
+function getBrowserTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
+function loadStoredTimezone(): string {
+  if (typeof window === "undefined") {
+    return "UTC";
+  }
+
+  return window.localStorage.getItem(TIMEZONE_STORAGE_KEY) || getBrowserTimezone();
+}
 
 export function useAppContext() {
   return useOutletContext<AppContext>();
@@ -33,7 +53,15 @@ const navigationItems = [
 export function AppLayout({ api }: AppLayoutProps) {
   const navigate = useNavigate();
   const [session, setSession] = useState<SessionResponse | null>(null);
+  const [timezone, setTimezoneState] = useState(loadStoredTimezone);
   const [loading, setLoading] = useState(true);
+
+  function setTimezone(value: string) {
+    setTimezoneState(value);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(TIMEZONE_STORAGE_KEY, value);
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -117,7 +145,7 @@ export function AppLayout({ api }: AppLayoutProps) {
       </aside>
 
       <section className="app-content">
-        <Outlet context={{ api, session }} />
+        <Outlet context={{ api, session, timezone, setTimezone }} />
       </section>
     </div>
   );

@@ -10,11 +10,11 @@ from sqlalchemy.orm import Session, selectinload
 from app.db.session import get_db_session
 from app.domains.accounts.dependencies import get_current_account
 from app.domains.accounts.models import Account
+from app.domains.application_accounts.service import ensure_target_ready
 from app.domains.applications.models import ApplicationRun
 from app.domains.applications.retry_policy import TerminalApplyError
-from app.domains.applications.service import execute_application_run
+from app.tasks.applications import enqueue_application_run
 from app.domains.jobs.models import Job
-from app.integrations.linkedin.apply import execute_linkedin_application_run
 
 router = APIRouter(prefix="/applications", tags=["applications"])
 
@@ -108,22 +108,24 @@ def trigger_application_run(
             detail="Job does not have an apply target",
         )
 
-    preferred_target = next((target for target in job.apply_targets if target.is_preferred), None)
-    target = preferred_target or job.apply_targets[0]
+    preferred_target = next((target for target in job.apply_targets if target.is_preferred), None) or job.apply_targets[0]
+
+    active_run = session.scalar(
+        select(ApplicationRun).where(
+            ApplicationRun.job_id == job_id,
+            ApplicationRun.account_id == current_account.id,
+            ApplicationRun.status.in_({"queued", "running"}),
+        )
+    )
+    if active_run:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"An application run is already active for this job (status: {active_run.status})",
+        )
 
     try:
-        if target.target_type == "linkedin_easy_apply":
-            result = execute_linkedin_application_run(
-                session,
-                account=current_account,
-                job_id=job.id,
-            )
-        else:
-            result = execute_application_run(
-                session,
-                account=current_account,
-                job_id=job.id,
-            )
+        ensure_target_ready(session, account_id=current_account.id, target=preferred_target)
+        enqueue_application_run(job.id, current_account.email)
     except (TerminalApplyError, ValueError) as error:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -131,8 +133,8 @@ def trigger_application_run(
         ) from error
 
     return TriggerApplicationRunResponse(
-        application_run_id=result.application_run_id,
-        status=result.status,
-        answer_entry_ids=result.answer_entry_ids,
-        created_question_task_ids=result.created_question_task_ids,
+        application_run_id=0,
+        status="queued",
+        answer_entry_ids=[],
+        created_question_task_ids=[],
     )

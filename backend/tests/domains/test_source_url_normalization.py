@@ -2,6 +2,7 @@ from app.domains.sources.models import JobSource
 from app.domains.sources.url_normalization import (
     derive_greenhouse_board_token,
     derive_lever_company_slug,
+    normalize_github_curated_url,
 )
 
 
@@ -62,3 +63,24 @@ def test_invalid_greenhouse_url_raises_clean_error() -> None:
         assert str(exc) == "Greenhouse sources need a valid board URL or settings.board_token."
     else:
         raise AssertionError("Expected ValueError for invalid Greenhouse URL")
+
+
+def test_github_blob_url_normalizes_to_raw_readme_url() -> None:
+    assert normalize_github_curated_url(
+        "https://github.com/SimplifyJobs/New-Grad-Positions/blob/dev/README.md"
+    ) == "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/README.md"
+
+
+def test_github_repo_url_defaults_to_head_readme() -> None:
+    assert normalize_github_curated_url("https://github.com/SimplifyJobs/New-Grad-Positions") == (
+        "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/HEAD/README.md"
+    )
+
+
+def test_invalid_github_curated_url_raises_clean_error() -> None:
+    try:
+        normalize_github_curated_url("https://example.com/jobs")
+    except ValueError as exc:
+        assert str(exc) == "GitHub curated sources need a GitHub README URL."
+    else:
+        raise AssertionError("Expected ValueError for invalid GitHub curated URL")

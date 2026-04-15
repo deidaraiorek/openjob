@@ -10,8 +10,14 @@ function buildApi(): AppApi {
     login: async () => ({ authenticated: true, email: "owner@example.com" }),
     logout: async () => undefined,
     listSources: async () => [],
-    createSource: async (payload) => ({ id: 1, last_synced_at: null, next_sync_at: null, sync_interval_hours: payload.sync_interval_hours ?? 6, ...payload }),
-    updateSource: async (sourceId, payload) => ({ id: sourceId, last_synced_at: null, next_sync_at: null, sync_interval_hours: payload.sync_interval_hours ?? 6, ...payload }),
+    createSource: async (payload) => {
+      const { sync_interval_hours, ...rest } = payload;
+      return { id: 1, ...rest, sync_interval_hours: sync_interval_hours ?? 6, last_synced_at: null, next_sync_at: null };
+    },
+    updateSource: async (sourceId, payload) => {
+      const { sync_interval_hours, ...rest } = payload;
+      return { id: sourceId, ...rest, sync_interval_hours: sync_interval_hours ?? 6, last_synced_at: null, next_sync_at: null };
+    },
     deleteSource: async () => undefined,
     syncSource: async () => ({
       source_id: 1,
@@ -22,6 +28,8 @@ function buildApi(): AppApi {
       updated: 0,
       pending_title_screening: 0,
       pending_full_relevance: 0,
+      last_synced_at: null,
+      next_sync_at: null,
     }),
     getRoleProfile: async () => ({
       id: 1,
@@ -30,6 +38,30 @@ function buildApi(): AppApi {
       generated_keywords: [],
     }),
     saveRoleProfile: async (payload) => ({ id: 1, ...payload }),
+    listApplicationAccounts: async () => [],
+    createApplicationAccount: async (payload) => ({
+      id: 1,
+      platform_family: payload.platform_family,
+      platform_label: payload.platform_family,
+      tenant_host: payload.tenant_host ?? "",
+      login_identifier_masked: "o***r@example.com",
+      credential_status: "ready",
+      last_successful_at: null,
+      last_failure_at: null,
+      last_failure_message: null,
+    }),
+    updateApplicationAccount: async (applicationAccountId, payload) => ({
+      id: applicationAccountId,
+      platform_family: payload.platform_family,
+      platform_label: payload.platform_family,
+      tenant_host: payload.tenant_host ?? "",
+      login_identifier_masked: "o***r@example.com",
+      credential_status: "ready",
+      last_successful_at: null,
+      last_failure_at: null,
+      last_failure_message: null,
+    }),
+    deleteApplicationAccount: async () => undefined,
     listAnswers: async () => [],
     createAnswer: async (payload) => ({ id: 1, ...payload }),
     uploadAnswerFile: async (payload: AnswerFileUploadPayload) => ({
@@ -92,6 +124,8 @@ function buildApi(): AppApi {
       answer_entry_ids: [],
       created_question_task_ids: [],
     }),
+    listQuestionAliases: async () => [],
+    updateQuestionAlias: async () => ({ id: 0, source_fingerprint: "", canonical_fingerprint: "", source_prompt: "", canonical_prompt: "", status: "rejected", similarity_score: 0 }),
     listActionNeeded: async () => [
       {
         application_run_id: 3,

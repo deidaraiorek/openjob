@@ -1,4 +1,9 @@
+from datetime import datetime
+
 from fastapi.testclient import TestClient
+
+from app.domains.accounts.service import ensure_account
+from app.domains.sources.models import JobSource
 
 
 def test_create_source_persists_source_settings(auth_client: TestClient) -> None:
@@ -26,6 +31,7 @@ def test_create_source_persists_source_settings(auth_client: TestClient) -> None
         "auto_sync_enabled": True,
         "sync_interval_hours": 6,
         "last_synced_at": None,
+        "last_sync_summary": {},
         "next_sync_at": response.json()["next_sync_at"],
     }
     assert response.json()["next_sync_at"] is not None
@@ -71,6 +77,10 @@ def test_sync_source_route_returns_summary(
             "updated": 5,
             "pending_title_screening": 0,
             "pending_full_relevance": 0,
+            "api_compatible_targets": 2,
+            "browser_compatible_targets": 1,
+            "manual_only_targets": 4,
+            "resolution_failed_targets": 1,
         }
 
     monkeypatch.setattr("app.domains.sources.routes.sync_source", fake_sync_source)
@@ -88,11 +98,92 @@ def test_sync_source_route_returns_summary(
         "updated": 5,
         "pending_title_screening": 0,
         "pending_full_relevance": 0,
+        "api_compatible_targets": 2,
+        "browser_compatible_targets": 1,
+        "manual_only_targets": 4,
+        "resolution_failed_targets": 1,
         "last_synced_at": payload["last_synced_at"],
         "next_sync_at": payload["next_sync_at"],
     }
     assert payload["last_synced_at"] is not None
     assert payload["next_sync_at"] is not None
+
+
+def test_sync_source_route_handles_sqlite_naive_lease_timestamps(
+    auth_client: TestClient,
+    db_session,
+    monkeypatch,
+) -> None:
+    create_response = auth_client.post(
+        "/api/sources",
+        json={
+            "source_key": "greenhouse-main",
+            "source_type": "greenhouse_board",
+            "name": "Greenhouse Main",
+            "base_url": "https://boards.greenhouse.io/example",
+            "settings": {"board_token": "example"},
+            "active": True,
+        },
+    )
+    source_id = create_response.json()["id"]
+    source = db_session.get(JobSource, source_id)
+
+    assert source is not None
+
+    # Simulate SQLite loading an existing lease timestamp without tzinfo.
+    source.sync_lease_expires_at = datetime(2026, 4, 8, 8, 0, 0)
+    db_session.commit()
+
+    def fake_sync_source(session, source_id, raw_payload=None):
+        return {
+            "processed": 1,
+            "created": 1,
+            "updated": 0,
+            "pending_title_screening": 0,
+            "pending_full_relevance": 0,
+            "api_compatible_targets": 1,
+            "browser_compatible_targets": 0,
+            "manual_only_targets": 0,
+            "resolution_failed_targets": 0,
+        }
+
+    monkeypatch.setattr("app.domains.sources.routes.sync_source", fake_sync_source)
+
+    response = auth_client.post(f"/api/sources/{source_id}/sync")
+
+    assert response.status_code == 200
+    assert response.json()["processed"] == 1
+
+
+def test_list_sources_serializes_sqlite_timestamps_as_utc(auth_client: TestClient, db_session) -> None:
+    create_response = auth_client.post(
+        "/api/sources",
+        json={
+            "source_key": "timezone-check",
+            "source_type": "greenhouse_board",
+            "name": "Timezone Check",
+            "base_url": "https://boards.greenhouse.io/example",
+            "settings": {},
+            "active": True,
+        },
+    )
+    source_id = create_response.json()["id"]
+    account = ensure_account(db_session, "owner@example.com")
+    source = db_session.get(JobSource, source_id)
+
+    assert source is not None
+    assert source.account_id == account.id
+
+    # Simulate SQLite dropping tzinfo on round-trip even though the value is logically UTC.
+    source.last_synced_at = datetime(2026, 4, 8, 10, 30, 0)
+    source.next_sync_at = datetime(2026, 4, 8, 16, 30, 0)
+    db_session.commit()
+
+    response = auth_client.get("/api/sources")
+
+    assert response.status_code == 200
+    assert response.json()[0]["last_synced_at"] == "2026-04-08T10:30:00Z"
+    assert response.json()[0]["next_sync_at"] == "2026-04-08T16:30:00Z"
 
 
 def test_update_source_persists_edited_values(auth_client: TestClient) -> None:
@@ -126,6 +217,40 @@ def test_update_source_persists_edited_values(auth_client: TestClient) -> None:
     assert response.json()["settings"] == {"note": "raw markdown"}
     assert response.json()["auto_sync_enabled"] is True
     assert response.json()["sync_interval_hours"] == 6
+
+
+def test_create_source_normalizes_github_urls_server_side(auth_client: TestClient) -> None:
+    response = auth_client.post(
+        "/api/sources",
+        json={
+            "source_key": "simplify-new-grad",
+            "source_type": "github_curated",
+            "name": "SimplifyJobs New Grad",
+            "base_url": "https://github.com/SimplifyJobs/New-Grad-Positions/blob/dev/README.md",
+            "settings": {},
+            "active": True,
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["base_url"] == "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/README.md"
+
+
+def test_create_source_rejects_invalid_github_curated_urls(auth_client: TestClient) -> None:
+    response = auth_client.post(
+        "/api/sources",
+        json={
+            "source_key": "bad-github",
+            "source_type": "github_curated",
+            "name": "Bad GitHub",
+            "base_url": "https://example.com/jobs",
+            "settings": {},
+            "active": True,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "GitHub curated sources need a GitHub README URL."
 
 
 def test_delete_source_removes_source(auth_client: TestClient) -> None:
@@ -281,6 +406,10 @@ def test_manual_sync_updates_source_schedule(auth_client: TestClient, monkeypatc
             "updated": 0,
             "pending_title_screening": 0,
             "pending_full_relevance": 0,
+            "api_compatible_targets": 1,
+            "browser_compatible_targets": 0,
+            "manual_only_targets": 0,
+            "resolution_failed_targets": 0,
         },
     )
 
@@ -290,4 +419,15 @@ def test_manual_sync_updates_source_schedule(auth_client: TestClient, monkeypatc
 
     assert response.status_code == 200
     assert source_payload["last_synced_at"] is not None
+    assert source_payload["last_sync_summary"] == {
+        "processed": 1,
+        "created": 1,
+        "updated": 0,
+        "pending_title_screening": 0,
+        "pending_full_relevance": 0,
+        "api_compatible_targets": 1,
+        "browser_compatible_targets": 0,
+        "manual_only_targets": 0,
+        "resolution_failed_targets": 0,
+    }
     assert source_payload["next_sync_at"] is not None

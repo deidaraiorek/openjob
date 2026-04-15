@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
@@ -18,6 +18,7 @@ from app.domains.sources.sync_control import (
     normalize_sync_interval_hours,
     release_source_sync_lease,
 )
+from app.domains.sources.url_normalization import normalize_github_curated_url
 from app.db.session import get_db_session
 from app.tasks.discovery import sync_source
 from app.tasks.job_relevance import drain_relevance_tasks_for_account
@@ -58,6 +59,7 @@ class SourceResponse(BaseModel):
     auto_sync_enabled: bool
     sync_interval_hours: int
     last_synced_at: datetime | None
+    last_sync_summary: dict[str, int]
     next_sync_at: datetime | None
 
 
@@ -70,8 +72,34 @@ class SourceSyncResponse(BaseModel):
     updated: int
     pending_title_screening: int
     pending_full_relevance: int
+    api_compatible_targets: int
+    browser_compatible_targets: int
+    manual_only_targets: int
+    resolution_failed_targets: int
     last_synced_at: datetime | None
     next_sync_at: datetime | None
+
+
+def normalize_source_payload(
+    *,
+    source_type: str,
+    base_url: str | None,
+    settings: dict[str, Any],
+) -> tuple[str | None, dict[str, Any]]:
+    normalized_base_url = base_url
+    normalized_settings = dict(settings)
+    if source_type == "github_curated":
+        normalized_base_url = normalize_github_curated_url(base_url)
+        normalized_settings.pop("raw_url", None)
+    return normalized_base_url, normalized_settings
+
+
+def _as_utc_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def serialize_source(source: JobSource) -> SourceResponse:
@@ -85,8 +113,9 @@ def serialize_source(source: JobSource) -> SourceResponse:
         active=source.active,
         auto_sync_enabled=source.auto_sync_enabled,
         sync_interval_hours=source.sync_interval_hours,
-        last_synced_at=source.last_synced_at,
-        next_sync_at=source.next_sync_at,
+        last_synced_at=_as_utc_datetime(source.last_synced_at),
+        last_sync_summary=source.last_sync_summary_json or {},
+        next_sync_at=_as_utc_datetime(source.next_sync_at),
     )
 
 
@@ -121,13 +150,22 @@ def create_source(
             detail="Source key already exists for this account",
         )
 
+    try:
+        normalized_base_url, normalized_settings = normalize_source_payload(
+            source_type=payload.source_type,
+            base_url=payload.base_url,
+            settings=payload.settings,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+
     source = JobSource(
         account_id=current_account.id,
         source_key=payload.source_key,
         source_type=payload.source_type,
         name=payload.name,
-        base_url=payload.base_url,
-        settings_json=payload.settings,
+        base_url=normalized_base_url,
+        settings_json=normalized_settings,
         active=payload.active,
         auto_sync_enabled=payload.auto_sync_enabled,
         sync_interval_hours=normalize_sync_interval_hours(payload.sync_interval_hours),
@@ -168,11 +206,20 @@ def update_source(
             detail="Source key already exists for this account",
         )
 
+    try:
+        normalized_base_url, normalized_settings = normalize_source_payload(
+            source_type=payload.source_type,
+            base_url=payload.base_url,
+            settings=payload.settings,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+
     source.source_key = payload.source_key
     source.source_type = payload.source_type
     source.name = payload.name
-    source.base_url = payload.base_url
-    source.settings_json = payload.settings
+    source.base_url = normalized_base_url
+    source.settings_json = normalized_settings
     source.active = payload.active
     source.auto_sync_enabled = payload.auto_sync_enabled
     source.sync_interval_hours = normalize_sync_interval_hours(payload.sync_interval_hours)
@@ -233,7 +280,7 @@ def trigger_source_sync(
 
     try:
         summary = sync_source(session, source.id)
-        session.refresh(source)
+        source.last_sync_summary_json = summary
         mark_source_synced(source)
         session.commit()
     except ValueError as exc:
@@ -257,6 +304,10 @@ def trigger_source_sync(
         updated=summary["updated"],
         pending_title_screening=summary["pending_title_screening"],
         pending_full_relevance=summary["pending_full_relevance"],
-        last_synced_at=source.last_synced_at,
-        next_sync_at=source.next_sync_at,
+        api_compatible_targets=summary["api_compatible_targets"],
+        browser_compatible_targets=summary["browser_compatible_targets"],
+        manual_only_targets=summary["manual_only_targets"],
+        resolution_failed_targets=summary["resolution_failed_targets"],
+        last_synced_at=_as_utc_datetime(source.last_synced_at),
+        next_sync_at=_as_utc_datetime(source.next_sync_at),
     )

@@ -2,9 +2,22 @@ import { useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 
 import { useAppContext } from "../app/layout";
-import type { AnswerCreatePayload, AnswerEntry } from "../lib/api";
+import type {
+  AnswerCreatePayload,
+  AnswerEntry,
+  ApplicationAccount,
+  ApplicationAccountCreatePayload,
+  ApplicationAccountUpdatePayload,
+} from "../lib/api";
 
-type ProfileTab = "role-profile" | "answers";
+type ProfileTab = "role-profile" | "answers" | "application-accounts";
+
+type ApplicationAccountFormState = {
+  platform_family: string;
+  tenant_host: string;
+  login_identifier: string;
+  password: string;
+};
 
 const initialForm: AnswerCreatePayload = {
   question_template_id: null,
@@ -12,6 +25,59 @@ const initialForm: AnswerCreatePayload = {
   answer_text: "",
   answer_payload: {},
 };
+
+const initialApplicationAccountForm: ApplicationAccountFormState = {
+  platform_family: "icims",
+  tenant_host: "",
+  login_identifier: "",
+  password: "",
+};
+
+const APPLICATION_ACCOUNT_PLATFORM_OPTIONS = [
+  { value: "icims", label: "iCIMS" },
+  { value: "jobvite", label: "Jobvite" },
+  { value: "workday", label: "Workday" },
+  { value: "linkedin", label: "LinkedIn" },
+];
+
+const COMMON_TIMEZONES = [
+  "UTC",
+  "America/New_York",
+  "America/Chicago",
+  "America/Denver",
+  "America/Los_Angeles",
+  "Europe/London",
+  "Europe/Berlin",
+  "Asia/Singapore",
+  "Asia/Tokyo",
+  "Australia/Sydney",
+];
+
+const TIMEZONE_QUICK_PICKS = [
+  "America/New_York",
+  "America/Chicago",
+  "America/Denver",
+  "America/Los_Angeles",
+  "UTC",
+];
+
+function getBrowserTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
+function tabFromSearch(search: string): ProfileTab {
+  if (search.includes("tab=answers")) {
+    return "answers";
+  }
+  if (search.includes("tab=application-accounts")) {
+    return "application-accounts";
+  }
+  return "role-profile";
+}
 
 function isFileAnswer(answer: AnswerEntry) {
   return answer.answer_payload.kind === "file";
@@ -32,15 +98,27 @@ function describeAnswerValue(answer: AnswerEntry) {
   return JSON.stringify(answer.answer_payload);
 }
 
+function describeCredentialStatus(account: ApplicationAccount): string {
+  const labels: Record<string, string> = {
+    ready: "Ready",
+    login_failed: "Login failed",
+    missing_password: "Missing password",
+  };
+  return labels[account.credential_status] ?? account.credential_status.replaceAll("_", " ");
+}
+
+function describeTenantHost(value: string): string {
+  return value || "Default / any employer host";
+}
+
 export function RoleProfileRoute() {
-  const { api } = useAppContext();
+  const { api, timezone, setTimezone } = useAppContext();
   const location = useLocation();
-  const [currentTab, setCurrentTab] = useState<ProfileTab>(
-    location.search.includes("tab=answers") ? "answers" : "role-profile",
-  );
+  const [currentTab, setCurrentTab] = useState<ProfileTab>(tabFromSearch(location.search));
 
   const [prompt, setPrompt] = useState("");
   const [status, setStatus] = useState<string | null>(null);
+  const [timezoneStatus, setTimezoneStatus] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   const [answers, setAnswers] = useState<AnswerEntry[]>([]);
@@ -48,8 +126,20 @@ export function RoleProfileRoute() {
   const [editingAnswerId, setEditingAnswerId] = useState<number | null>(null);
   const [answerError, setAnswerError] = useState<string | null>(null);
 
+  const [applicationAccounts, setApplicationAccounts] = useState<ApplicationAccount[]>([]);
+  const [applicationAccountForm, setApplicationAccountForm] = useState(initialApplicationAccountForm);
+  const [editingApplicationAccountId, setEditingApplicationAccountId] = useState<number | null>(null);
+  const [applicationAccountError, setApplicationAccountError] = useState<string | null>(null);
+  const [applicationAccountStatus, setApplicationAccountStatus] = useState<string | null>(null);
+  const [applicationAccountSubmitting, setApplicationAccountSubmitting] = useState(false);
+  const [deletingApplicationAccountId, setDeletingApplicationAccountId] = useState<number | null>(null);
+
   async function reloadAnswers() {
     setAnswers(await api.listAnswers());
+  }
+
+  async function reloadApplicationAccounts() {
+    setApplicationAccounts(await api.listApplicationAccounts());
   }
 
   useEffect(() => {
@@ -62,7 +152,7 @@ export function RoleProfileRoute() {
       }
     }
 
-    void Promise.all([loadProfile(), reloadAnswers()]);
+    void Promise.all([loadProfile(), reloadAnswers(), reloadApplicationAccounts()]);
   }, [api]);
 
   async function handleProfileSubmit(event: React.FormEvent<HTMLFormElement>) {
@@ -101,6 +191,79 @@ export function RoleProfileRoute() {
     }
   }
 
+  async function handleApplicationAccountSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setApplicationAccountError(null);
+    setApplicationAccountStatus(null);
+
+    const tenantHost = applicationAccountForm.tenant_host.trim();
+    const loginIdentifier = applicationAccountForm.login_identifier.trim();
+    const password = applicationAccountForm.password.trim();
+
+    if (editingApplicationAccountId === null && !loginIdentifier) {
+      setApplicationAccountError("Login email or username is required.");
+      return;
+    }
+
+    if (editingApplicationAccountId === null && !password) {
+      setApplicationAccountError("Password is required for a new application account.");
+      return;
+    }
+
+    setApplicationAccountSubmitting(true);
+    try {
+      if (editingApplicationAccountId !== null) {
+        const payload: ApplicationAccountUpdatePayload = {
+          platform_family: applicationAccountForm.platform_family,
+          tenant_host: tenantHost || null,
+          ...(loginIdentifier ? { login_identifier: loginIdentifier } : {}),
+          ...(password ? { password } : {}),
+        };
+        await api.updateApplicationAccount(editingApplicationAccountId, payload);
+        setApplicationAccountStatus("Application account updated.");
+      } else {
+        const payload: ApplicationAccountCreatePayload = {
+          platform_family: applicationAccountForm.platform_family,
+          tenant_host: tenantHost || null,
+          login_identifier: loginIdentifier,
+          password,
+        };
+        await api.createApplicationAccount(payload);
+        setApplicationAccountStatus("Application account saved.");
+      }
+      setApplicationAccountForm(initialApplicationAccountForm);
+      setEditingApplicationAccountId(null);
+      await reloadApplicationAccounts();
+    } catch (caughtError) {
+      setApplicationAccountError(
+        caughtError instanceof Error ? caughtError.message : "Unable to save application account.",
+      );
+    } finally {
+      setApplicationAccountSubmitting(false);
+    }
+  }
+
+  async function handleDeleteApplicationAccount(accountId: number) {
+    setDeletingApplicationAccountId(accountId);
+    setApplicationAccountError(null);
+    setApplicationAccountStatus(null);
+    try {
+      await api.deleteApplicationAccount(accountId);
+      if (editingApplicationAccountId === accountId) {
+        setEditingApplicationAccountId(null);
+        setApplicationAccountForm(initialApplicationAccountForm);
+      }
+      setApplicationAccountStatus("Application account deleted.");
+      await reloadApplicationAccounts();
+    } catch (caughtError) {
+      setApplicationAccountError(
+        caughtError instanceof Error ? caughtError.message : "Unable to delete application account.",
+      );
+    } finally {
+      setDeletingApplicationAccountId(null);
+    }
+  }
+
   function handleEdit(answer: AnswerEntry) {
     setEditingAnswerId(answer.id);
     setForm({
@@ -119,8 +282,28 @@ export function RoleProfileRoute() {
     setAnswerError(null);
   }
 
+  function handleEditApplicationAccount(account: ApplicationAccount) {
+    setEditingApplicationAccountId(account.id);
+    setApplicationAccountForm({
+      platform_family: account.platform_family,
+      tenant_host: account.tenant_host,
+      login_identifier: "",
+      password: "",
+    });
+    setApplicationAccountError(null);
+    setApplicationAccountStatus(null);
+    setCurrentTab("application-accounts");
+  }
+
+  function handleCancelApplicationAccountEdit() {
+    setEditingApplicationAccountId(null);
+    setApplicationAccountForm(initialApplicationAccountForm);
+    setApplicationAccountError(null);
+    setApplicationAccountStatus(null);
+  }
+
   useEffect(() => {
-    setCurrentTab(location.search.includes("tab=answers") ? "answers" : "role-profile");
+    setCurrentTab(tabFromSearch(location.search));
   }, [location.search]);
 
   return (
@@ -131,7 +314,7 @@ export function RoleProfileRoute() {
             <p className="eyebrow">Profile</p>
             <h1>Centralized user profile</h1>
             <p className="supporting-copy">
-              Keep your role targeting, reusable answers, and upload memory together so future application runs pull from one place.
+              Keep your role targeting, reusable answers, and login-ready application accounts together so future runs pull from one place.
             </p>
           </div>
         </div>
@@ -154,6 +337,15 @@ export function RoleProfileRoute() {
             onClick={() => setCurrentTab("answers")}
           >
             Saved Answers
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={currentTab === "application-accounts"}
+            className={currentTab === "application-accounts" ? "profile-tab-button active" : "profile-tab-button"}
+            onClick={() => setCurrentTab("application-accounts")}
+          >
+            Application Accounts
           </button>
         </div>
 
@@ -180,8 +372,65 @@ export function RoleProfileRoute() {
                 </button>
               </div>
             </form>
+
+            <div className="profile-preference-card">
+              <div className="profile-preference-header">
+                <div>
+                  <h2>Timezone</h2>
+                  <p className="supporting-copy">
+                    Source sync times are stored in UTC and displayed here in the timezone you choose.
+                  </p>
+                </div>
+                <div className="profile-timezone-current">
+                  <span className="profile-timezone-current-label">Current</span>
+                  <strong>{timezone}</strong>
+                </div>
+              </div>
+
+              <div className="profile-timezone-meta">
+                <span className="profile-timezone-note">Browser detected: {getBrowserTimezone()}</span>
+                <span className="profile-timezone-note">Applies to source sync timestamps in this portal.</span>
+              </div>
+
+              <div className="profile-timezone-quick-picks" role="group" aria-label="Common timezone choices">
+                {TIMEZONE_QUICK_PICKS.map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    className={timezone === option ? "profile-timezone-chip active" : "profile-timezone-chip"}
+                    onClick={() => {
+                      setTimezone(option);
+                      setTimezoneStatus(`Timezone set to ${option}.`);
+                    }}
+                  >
+                    {option}
+                  </button>
+                ))}
+              </div>
+
+              <label className="full-width profile-timezone-field">
+                <span>Choose another timezone</span>
+                <select
+                  value={timezone}
+                  onChange={(event) => {
+                    setTimezone(event.target.value);
+                    setTimezoneStatus(`Timezone set to ${event.target.value}.`);
+                  }}
+                >
+                  {COMMON_TIMEZONES.includes(timezone) ? null : <option value={timezone}>{timezone}</option>}
+                  {COMMON_TIMEZONES.map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {timezoneStatus ? <p className="success-copy">{timezoneStatus}</p> : null}
+            </div>
           </section>
-        ) : (
+        ) : null}
+
+        {currentTab === "answers" ? (
           <section className="profile-section" aria-label="Saved answers section">
             <div className="profile-section-copy">
               <p className="supporting-copy">
@@ -242,7 +491,131 @@ export function RoleProfileRoute() {
               </article>
             </div>
           </section>
-        )}
+        ) : null}
+
+        {currentTab === "application-accounts" ? (
+          <section className="profile-section" aria-label="Application accounts section">
+            <div className="profile-section-copy">
+              <p className="supporting-copy">
+                Store login credentials for platforms that use returning-candidate accounts or employer-specific portals. Passwords stay write-only.
+              </p>
+            </div>
+
+            <div className="content-grid">
+              <article className="panel-card profile-subcard">
+                {applicationAccounts.length === 0 ? (
+                  <p className="empty-copy">No application accounts saved yet.</p>
+                ) : (
+                  <ul className="stack-list">
+                    {applicationAccounts.map((account) => (
+                      <li key={account.id} className="stack-row stack-row-column">
+                        <strong>{account.platform_label}</strong>
+                        <span>{describeTenantHost(account.tenant_host)}</span>
+                        <span>{account.login_identifier_masked}</span>
+                        <span>{describeCredentialStatus(account)}</span>
+                        {account.last_failure_message ? <span>{account.last_failure_message}</span> : null}
+                        <div className="button-row">
+                          <button type="button" className="secondary-button" onClick={() => handleEditApplicationAccount(account)}>
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            className="ghost-button"
+                            disabled={deletingApplicationAccountId === account.id}
+                            onClick={() => void handleDeleteApplicationAccount(account.id)}
+                          >
+                            {deletingApplicationAccountId === account.id ? "Deleting..." : "Delete"}
+                          </button>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </article>
+
+              <article className="panel-card profile-subcard">
+                <h2>{editingApplicationAccountId !== null ? "Edit application account" : "Add application account"}</h2>
+                <p className="supporting-copy">
+                  Use employer host when a platform keeps separate candidate logins per company. Leave it blank when one login works everywhere.
+                </p>
+                <form className="form-grid" onSubmit={handleApplicationAccountSubmit}>
+                  <label>
+                    <span>Platform</span>
+                    <select
+                      value={applicationAccountForm.platform_family}
+                      onChange={(event) =>
+                        setApplicationAccountForm((current) => ({ ...current, platform_family: event.target.value }))
+                      }
+                    >
+                      {APPLICATION_ACCOUNT_PLATFORM_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    <span>Employer host</span>
+                    <input
+                      placeholder="acme.icims.com"
+                      value={applicationAccountForm.tenant_host}
+                      onChange={(event) =>
+                        setApplicationAccountForm((current) => ({ ...current, tenant_host: event.target.value }))
+                      }
+                    />
+                  </label>
+                  <label>
+                    <span>Login email or username</span>
+                    <input
+                      placeholder={
+                        editingApplicationAccountId !== null
+                          ? "Leave blank to keep the current login"
+                          : "candidate@example.com"
+                      }
+                      value={applicationAccountForm.login_identifier}
+                      onChange={(event) =>
+                        setApplicationAccountForm((current) => ({ ...current, login_identifier: event.target.value }))
+                      }
+                    />
+                  </label>
+                  <label>
+                    <span>{editingApplicationAccountId !== null ? "New password (optional)" : "Password"}</span>
+                    <input
+                      type="password"
+                      value={applicationAccountForm.password}
+                      onChange={(event) =>
+                        setApplicationAccountForm((current) => ({ ...current, password: event.target.value }))
+                      }
+                    />
+                  </label>
+                  {applicationAccountError ? <p className="error-copy">{applicationAccountError}</p> : null}
+                  {applicationAccountStatus ? <p className="success-copy">{applicationAccountStatus}</p> : null}
+                  <div className="button-row">
+                    <button
+                      type="submit"
+                      disabled={
+                        applicationAccountSubmitting
+                        || (editingApplicationAccountId === null && !applicationAccountForm.login_identifier.trim())
+                        || (editingApplicationAccountId === null && !applicationAccountForm.password.trim())
+                      }
+                    >
+                      {applicationAccountSubmitting
+                        ? "Working..."
+                        : editingApplicationAccountId !== null
+                          ? "Save account changes"
+                          : "Save application account"}
+                    </button>
+                    {editingApplicationAccountId !== null ? (
+                      <button type="button" className="secondary-button" onClick={handleCancelApplicationAccountEdit}>
+                        Cancel
+                      </button>
+                    ) : null}
+                  </div>
+                </form>
+              </article>
+            </div>
+          </section>
+        ) : null}
       </section>
     </main>
   );

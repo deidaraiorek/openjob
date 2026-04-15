@@ -301,13 +301,22 @@ def _relevance_payload_inconsistent(*, decision: str, payload: dict[str, Any]) -
         return True
     if decision == "match" and contradiction in {"moderate", "strong"}:
         return True
-    return (
+    if (
         decision == "reject"
         and family == "same_family"
         and seniority in {"same_band", "adjacent_or_same"}
         and modifier in {"none", "specialization_only"}
         and contradiction in {"none", "weak"}
-    )
+    ):
+        return True
+    if (
+        decision == "review"
+        and family in {"same_family", "adjacent_family"}
+        and seniority in {"same_band", "adjacent_or_same"}
+        and contradiction in {"none", "weak"}
+    ):
+        return True
+    return False
 
 
 def _normalize_text(value: str) -> str:

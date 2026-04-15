@@ -57,7 +57,8 @@ def release_source_sync_lease(session: Session, *, source_id: int) -> None:
     session.execute(
         update(JobSource)
         .where(JobSource.id == source_id)
-        .values(sync_lease_expires_at=None),
+        .values(sync_lease_expires_at=None)
+        .execution_options(synchronize_session=False),
     )
     session.flush()
 
@@ -72,7 +73,8 @@ def acquire_source_sync_lease(session: Session, *, source_id: int) -> bool:
             JobSource.id == source_id,
             (JobSource.sync_lease_expires_at.is_(None) | (JobSource.sync_lease_expires_at <= now)),
         )
-        .values(sync_lease_expires_at=lease_expires_at),
+        .values(sync_lease_expires_at=lease_expires_at)
+        .execution_options(synchronize_session=False),
     )
     session.flush()
     return bool(result.rowcount)

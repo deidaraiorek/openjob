@@ -71,17 +71,59 @@ function displaySourceName(source: Source): string {
   return source.name.trim() || source.source_key;
 }
 
-function formatSyncTimestamp(value: string | null): string {
+const ISO_OFFSET_PATTERN = /(Z|[+-]\d{2}:\d{2})$/i;
+
+function parseUtcTimestamp(value: string): Date | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const normalized = ISO_OFFSET_PATTERN.test(trimmed) ? trimmed : `${trimmed}Z`;
+  const timestamp = new Date(normalized);
+  if (Number.isNaN(timestamp.getTime())) {
+    return null;
+  }
+  return timestamp;
+}
+
+function formatSyncTimestamp(value: string | null, timezone: string): string {
   if (!value) {
     return "Not scheduled yet.";
   }
 
-  const timestamp = new Date(value);
-  if (Number.isNaN(timestamp.getTime())) {
+  const timestamp = parseUtcTimestamp(value);
+  if (!timestamp) {
     return value;
   }
 
-  return timestamp.toLocaleString();
+  return timestamp.toLocaleString(undefined, { timeZone: timezone });
+}
+
+function chooseNewerTimestamp(currentValue: string | null, incomingValue: string | null): string | null {
+  if (!currentValue) {
+    return incomingValue;
+  }
+  if (!incomingValue) {
+    return currentValue;
+  }
+
+  const currentTimestamp = parseUtcTimestamp(currentValue);
+  const incomingTimestamp = parseUtcTimestamp(incomingValue);
+  if (!currentTimestamp || !incomingTimestamp) {
+    return incomingValue;
+  }
+
+  return incomingTimestamp.getTime() >= currentTimestamp.getTime() ? incomingValue : currentValue;
+}
+
+function mergeSourceWithFreshSyncState(currentSource: Source, incomingSource: Source): Source {
+  return {
+    ...currentSource,
+    ...incomingSource,
+    last_synced_at: chooseNewerTimestamp(currentSource.last_synced_at, incomingSource.last_synced_at),
+    next_sync_at: chooseNewerTimestamp(currentSource.next_sync_at, incomingSource.next_sync_at),
+  };
 }
 
 function formatSettingsPreview(settings: Record<string, unknown>): string {
@@ -97,8 +139,36 @@ function getSyncIntervalHours(source: Source): number {
   return Number.isFinite(source.sync_interval_hours) ? Math.max(1, source.sync_interval_hours) : 6;
 }
 
+function formatCompatibilitySummary(summary: Record<string, unknown> | null | undefined): string {
+  if (!summary) {
+    return "No compatibility data yet.";
+  }
+
+  const apiCompatible = Number(summary.api_compatible_targets ?? 0);
+  const browserCompatible = Number(summary.browser_compatible_targets ?? 0);
+  const manualOnly = Number(summary.manual_only_targets ?? 0);
+  const resolutionFailed = Number(summary.resolution_failed_targets ?? 0);
+  const parts: string[] = [];
+  if (apiCompatible > 0) {
+    parts.push(`${apiCompatible} API-compatible`);
+  }
+  if (browserCompatible > 0) {
+    parts.push(`${browserCompatible} browser-compatible`);
+  }
+  if (manualOnly > 0) {
+    parts.push(`${manualOnly} manual-only`);
+  }
+  if (resolutionFailed > 0) {
+    parts.push(`${resolutionFailed} resolution failed`);
+  }
+  if (parts.length === 0) {
+    return "No compatibility data yet.";
+  }
+  return parts.join(", ");
+}
+
 export function SourcesRoute() {
-  const { api } = useAppContext();
+  const { api, timezone } = useAppContext();
   const [sources, setSources] = useState<Source[]>([]);
   const [expandedSourceIds, setExpandedSourceIds] = useState<number[]>([]);
   const [form, setForm] = useState(initialForm);
@@ -139,7 +209,9 @@ export function SourcesRoute() {
   function mergeSource(savedSource: Source) {
     setSources((current) => {
       const next = current.some((source) => source.id === savedSource.id)
-        ? current.map((source) => (source.id === savedSource.id ? savedSource : source))
+        ? current.map((source) =>
+            source.id === savedSource.id ? mergeSourceWithFreshSyncState(source, savedSource) : source,
+          )
         : [...current, savedSource];
 
       return [...next].sort((left, right) => left.name.localeCompare(right.name));
@@ -147,7 +219,16 @@ export function SourcesRoute() {
   }
 
   async function reloadSources() {
-    setSources([...(await api.listSources())]);
+    const freshSources = await api.listSources();
+    setSources((current) => {
+      const currentById = new Map(current.map((source) => [source.id, source]));
+      const mergedSources = freshSources.map((source) => {
+        const existingSource = currentById.get(source.id);
+        return existingSource ? mergeSourceWithFreshSyncState(existingSource, source) : source;
+      });
+
+      return [...mergedSources].sort((left, right) => left.name.localeCompare(right.name));
+    });
   }
 
   useEffect(() => {
@@ -230,17 +311,20 @@ export function SourcesRoute() {
 
     try {
       const summary = await api.syncSource(source.id);
-      setSources((current) =>
-        current.map((item) =>
-          item.id === source.id
-            ? {
-                ...item,
-                last_synced_at: summary.last_synced_at,
-                next_sync_at: summary.next_sync_at,
-              }
-            : item,
-        ),
-      );
+      const applySyncSummary = () =>
+        setSources((current) =>
+          current.map((item) =>
+            item.id === source.id
+              ? {
+                  ...item,
+                  last_synced_at: summary.last_synced_at ?? item.last_synced_at,
+                  next_sync_at: summary.next_sync_at ?? item.next_sync_at,
+                }
+              : item,
+          ),
+        );
+
+      applySyncSummary();
       const pendingBits: string[] = [];
       if (summary.pending_title_screening) {
         pendingBits.push(`${summary.pending_title_screening} pending title screen`);
@@ -249,10 +333,19 @@ export function SourcesRoute() {
         pendingBits.push(`${summary.pending_full_relevance} pending relevance`);
       }
       const pendingSuffix = pendingBits.length > 0 ? ` ${pendingBits.join(", ")}.` : "";
+      const compatibilityBits = [
+        summary.api_compatible_targets ? `${summary.api_compatible_targets} API-compatible` : null,
+        summary.browser_compatible_targets ? `${summary.browser_compatible_targets} browser-compatible` : null,
+        summary.manual_only_targets ? `${summary.manual_only_targets} manual-only` : null,
+        summary.resolution_failed_targets ? `${summary.resolution_failed_targets} resolution failed` : null,
+      ].filter((value): value is string => Boolean(value));
+      const compatibilitySuffix =
+        compatibilityBits.length > 0 ? ` Compatibility: ${compatibilityBits.join(", ")}.` : "";
       setSyncMessage(
-        `${source.name} synced: ${summary.processed} processed, ${summary.created} new, ${summary.updated} updated.${pendingSuffix}`,
+        `${source.name} synced: ${summary.processed} processed, ${summary.created} new, ${summary.updated} updated.${pendingSuffix}${compatibilitySuffix}`,
       );
       await reloadSources();
+      applySyncSummary();
     } catch (caughtError) {
       if (caughtError instanceof Error) {
         setSyncMessage(caughtError.message);
@@ -381,17 +474,25 @@ export function SourcesRoute() {
                         </div>
                         <div className="source-link-block">
                           <span className="source-link-label">Last sync</span>
-                          <p className="source-link-value">{formatSyncTimestamp(source.last_synced_at)}</p>
+                          <p className="source-link-value">{formatSyncTimestamp(source.last_synced_at, timezone)}</p>
                         </div>
                         <div className="source-link-block">
                           <span className="source-link-label">Next sync</span>
                           <p className="source-link-value">
-                            {source.active ? formatSyncTimestamp(source.next_sync_at) : "Paused while source is inactive"}
+                            {source.active ? formatSyncTimestamp(source.next_sync_at, timezone) : "Paused while source is inactive"}
                           </p>
+                        </div>
+                        <div className="source-link-block">
+                          <span className="source-link-label">Timezone</span>
+                          <p className="source-link-value">{timezone}</p>
                         </div>
                         <div className="source-link-block">
                           <span className="source-link-label">Config</span>
                           <pre className="source-config-preview">{formatSettingsPreview(source.settings)}</pre>
+                        </div>
+                        <div className="source-link-block">
+                          <span className="source-link-label">Last compatibility scan</span>
+                          <p className="source-link-value">{formatCompatibilitySummary(source.last_sync_summary)}</p>
                         </div>
                       </div>
                     ) : null}

@@ -20,4 +20,6 @@ class Account(TimestampMixin, Base):
     answer_entries = relationship("AnswerEntry", back_populates="account")
     question_tasks = relationship("QuestionTask", back_populates="account")
     application_runs = relationship("ApplicationRun", back_populates="account")
+    application_accounts = relationship("ApplicationAccount", back_populates="account")
     job_relevance_tasks = relationship("JobRelevanceTask", back_populates="account")
+    question_aliases = relationship("QuestionAlias", back_populates="account")

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 from sqlalchemy import select
 
 from app.celery_app import celery_app
@@ -23,3 +25,14 @@ def run_application(job_id: int, account_email: str = "owner@example.com") -> di
             "answer_entry_ids": result.answer_entry_ids,
             "created_question_task_ids": result.created_question_task_ids,
         }
+
+
+def enqueue_application_run(job_id: int, account_email: str = "owner@example.com") -> None:
+    try:
+        run_application.delay(job_id, account_email)
+    except Exception:
+        threading.Thread(
+            target=run_application,
+            args=(job_id, account_email),
+            daemon=True,
+        ).start()

@@ -65,12 +65,10 @@ def build_submission_payload(
 def submit_application(
     board_token: str,
     job_post_id: str,
-    api_key: str,
     submission_payload: dict[str, Any],
 ) -> dict[str, Any]:
     response = httpx.post(
         f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs/{job_post_id}",
-        auth=httpx.BasicAuth(api_key, ""),
         json=submission_payload,
         timeout=30.0,
     )

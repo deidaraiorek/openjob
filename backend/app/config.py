@@ -22,9 +22,12 @@ class Settings(BaseSettings):
     owner_email: str = "owner@example.com"
     owner_password: str = "changeme"
     session_secret: str = "replace-me"
+    application_account_secret_key: str = "b3BlbmpvYi1hcHBsaWNhdGlvbi1hY2NvdW50cy1rZXk="
     secure_cookies: bool = False
     playwright_profile_dir: str = "/tmp/openjob-playwright"
     playwright_artifact_dir: str = "/tmp/openjob-playwright-artifacts"
+    playwright_headless: bool = True
+    playwright_timeout_ms: int = 15_000
     answer_file_storage_dir: str = "/tmp/openjob-answer-files"
     groq_api_key: str | None = None
     groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"

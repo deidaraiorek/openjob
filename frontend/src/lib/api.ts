@@ -14,6 +14,7 @@ export type Source = {
   auto_sync_enabled: boolean;
   sync_interval_hours: number;
   last_synced_at: string | null;
+  last_sync_summary?: Record<string, number>;
   next_sync_at: string | null;
 };
 
@@ -26,6 +27,10 @@ export type SourceSyncResult = {
   updated: number;
   pending_title_screening: number;
   pending_full_relevance: number;
+  api_compatible_targets?: number;
+  browser_compatible_targets?: number;
+  manual_only_targets?: number;
+  resolution_failed_targets?: number;
   last_synced_at: string | null;
   next_sync_at: string | null;
 };
@@ -56,6 +61,32 @@ export type RoleProfilePayload = {
   prompt: string;
   generated_titles: string[];
   generated_keywords: string[];
+};
+
+export type ApplicationAccount = {
+  id: number;
+  platform_family: string;
+  platform_label: string;
+  tenant_host: string;
+  login_identifier_masked: string;
+  credential_status: string;
+  last_successful_at: string | null;
+  last_failure_at: string | null;
+  last_failure_message: string | null;
+};
+
+export type ApplicationAccountCreatePayload = {
+  platform_family: string;
+  tenant_host: string | null;
+  login_identifier: string;
+  password: string;
+};
+
+export type ApplicationAccountUpdatePayload = {
+  platform_family: string;
+  tenant_host: string | null;
+  login_identifier?: string | null;
+  password?: string | null;
 };
 
 export type AnswerEntry = {
@@ -97,6 +128,16 @@ export type ResolveQuestionTaskPayload = {
   linked_answer_entry_id: number | null;
 };
 
+export type QuestionAlias = {
+  id: number;
+  source_fingerprint: string;
+  canonical_fingerprint: string;
+  source_prompt: string;
+  canonical_prompt: string;
+  status: string;
+  similarity_score: number;
+};
+
 export type JobListItem = {
   id: number;
   canonical_key: string;
@@ -116,9 +157,37 @@ export type JobListItem = {
   pending_relevance_failure_cause?: string | null;
   pending_relevance_next_retry_at?: string | null;
   preferred_apply_target_type: string | null;
+  preferred_apply_target_platform_family?: string | null;
+  preferred_apply_target_platform_label?: string | null;
+  preferred_apply_target_driver_family?: string | null;
+  preferred_apply_target_compatibility_state?: string | null;
+  preferred_apply_target_compatibility_label?: string | null;
+  preferred_apply_target_compatibility_reason?: string | null;
+  preferred_apply_target_credential_policy?: string | null;
+  preferred_apply_target_readiness_status?: string | null;
+  preferred_apply_target_readiness_reason?: string | null;
   sighting_count: number;
   open_question_task_count: number;
   latest_application_run_status: string | null;
+};
+
+export type ApplyTargetDetail = {
+  id: number;
+  target_type: string;
+  destination_url: string;
+  is_preferred: boolean;
+  source_url?: string | null;
+  resolved_destination_url?: string | null;
+  platform_family: string;
+  platform_label: string;
+  driver_family: string;
+  compatibility_state?: string;
+  compatibility_label?: string;
+  compatibility_reason?: string | null;
+  credential_policy: string;
+  readiness_status: string;
+  readiness_reason: string | null;
+  tenant_host: string;
 };
 
 export type JobDetail = {
@@ -142,16 +211,15 @@ export type JobDetail = {
   sightings: {
     id: number;
     source_id: number | null;
+    source_name?: string | null;
+    source_type?: string | null;
     external_job_id: string | null;
     listing_url: string;
     apply_url: string | null;
+    outbound_links?: { kind: string; label: string | null; url: string }[];
   }[];
-  preferred_apply_target: {
-    id: number;
-    target_type: string;
-    destination_url: string;
-    is_preferred: boolean;
-  } | null;
+  apply_targets?: ApplyTargetDetail[];
+  preferred_apply_target: ApplyTargetDetail | null;
   question_tasks: {
     id: number;
     prompt_text: string;
@@ -240,12 +308,21 @@ export interface AppApi extends AuthApi {
   syncSource(sourceId: number): Promise<SourceSyncResult>;
   getRoleProfile(): Promise<RoleProfile>;
   saveRoleProfile(payload: RoleProfilePayload): Promise<RoleProfile>;
+  listApplicationAccounts(): Promise<ApplicationAccount[]>;
+  createApplicationAccount(payload: ApplicationAccountCreatePayload): Promise<ApplicationAccount>;
+  updateApplicationAccount(
+    applicationAccountId: number,
+    payload: ApplicationAccountUpdatePayload,
+  ): Promise<ApplicationAccount>;
+  deleteApplicationAccount(applicationAccountId: number): Promise<void>;
   listAnswers(): Promise<AnswerEntry[]>;
   createAnswer(payload: AnswerCreatePayload): Promise<AnswerEntry>;
   uploadAnswerFile(payload: AnswerFileUploadPayload): Promise<AnswerEntry>;
   updateAnswer(answerId: number, payload: AnswerUpdatePayload): Promise<AnswerEntry>;
-  listQuestionTasks(): Promise<QuestionTask[]>;
+  listQuestionTasks(jobId?: number): Promise<QuestionTask[]>;
   resolveQuestionTask(taskId: number, payload: ResolveQuestionTaskPayload): Promise<QuestionTask>;
+  listQuestionAliases(status?: string): Promise<QuestionAlias[]>;
+  updateQuestionAlias(aliasId: number, status: "approved" | "rejected"): Promise<QuestionAlias>;
   listJobs(relevance?: string): Promise<JobListItem[]>;
   getJobDetail(jobId: number): Promise<JobDetail>;
   updateJobRelevance(jobId: number, payload: JobRelevanceUpdatePayload): Promise<JobRelevanceUpdateResult>;
@@ -382,6 +459,26 @@ export const apiClient: AppApi = {
       body: JSON.stringify(payload),
     });
   },
+  listApplicationAccounts() {
+    return request<ApplicationAccount[]>("/api/application-accounts");
+  },
+  createApplicationAccount(payload) {
+    return request<ApplicationAccount>("/api/application-accounts", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+  updateApplicationAccount(applicationAccountId, payload) {
+    return request<ApplicationAccount>(`/api/application-accounts/${applicationAccountId}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+  },
+  deleteApplicationAccount(applicationAccountId) {
+    return request<void>(`/api/application-accounts/${applicationAccountId}`, {
+      method: "DELETE",
+    });
+  },
   listAnswers() {
     return request<AnswerEntry[]>("/api/answers");
   },
@@ -408,8 +505,9 @@ export const apiClient: AppApi = {
       body: JSON.stringify(payload),
     });
   },
-  listQuestionTasks() {
-    return request<QuestionTask[]>("/api/questions/tasks");
+  listQuestionTasks(jobId?: number) {
+    const url = jobId ? `/api/questions/tasks?job_id=${jobId}` : "/api/questions/tasks";
+    return request<QuestionTask[]>(url);
   },
   resolveQuestionTask(taskId, payload) {
     return request<QuestionTask>(`/api/questions/tasks/${taskId}/resolve`, {
@@ -441,5 +539,14 @@ export const apiClient: AppApi = {
   },
   listActionNeeded() {
     return request<ActionNeededItem[]>("/api/applications/action-needed");
+  },
+  listQuestionAliases(status = "suggested") {
+    return request<QuestionAlias[]>(`/api/questions/aliases?status=${encodeURIComponent(status)}`);
+  },
+  updateQuestionAlias(aliasId, status) {
+    return request<QuestionAlias>(`/api/questions/aliases/${aliasId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status }),
+    });
   },
 };

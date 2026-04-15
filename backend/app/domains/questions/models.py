@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import ForeignKey, String, UniqueConstraint
+from sqlalchemy import Float, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -81,3 +81,23 @@ class QuestionTask(TimestampMixin, Base):
     question_template = relationship("QuestionTemplate", back_populates="question_tasks")
     linked_answer_entry = relationship("AnswerEntry", back_populates="resolved_tasks")
     application_run = relationship("ApplicationRun", back_populates="question_tasks")
+
+
+class QuestionAlias(TimestampMixin, Base):
+    __tablename__ = "question_aliases"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "source_fingerprint",
+            name="uq_question_aliases_account_source",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    source_fingerprint: Mapped[str] = mapped_column(String(255))
+    canonical_fingerprint: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(20), default="suggested")
+    similarity_score: Mapped[float] = mapped_column(Float())
+
+    account = relationship("Account", back_populates="question_aliases")
