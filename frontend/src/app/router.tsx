@@ -9,12 +9,14 @@ import { AppLayout } from "./layout";
 import { apiClient, type AppApi } from "../lib/api";
 import { DashboardRoute } from "../routes/dashboard";
 import { ActionNeededRoute } from "../routes/action-needed";
+import { ApplicationRunLogRoute } from "../routes/application-run-log";
 import { JobDetailRoute } from "../routes/job-detail";
 import { JobsRoute } from "../routes/jobs";
 import { LoginRoute } from "../routes/login";
 import { QuestionsRoute } from "../routes/questions";
 import { RoleProfileRoute } from "../routes/role-profile";
 import { SourcesRoute } from "../routes/sources";
+import { SystemLogRoute } from "../routes/system-log";
 
 export function buildRoutes(api: AppApi = apiClient): RouteObject[] {
   return [
@@ -57,6 +59,14 @@ export function buildRoutes(api: AppApi = apiClient): RouteObject[] {
         {
           path: "role-profile",
           element: <RoleProfileRoute />,
+        },
+        {
+          path: "system-log",
+          element: <SystemLogRoute />,
+        },
+        {
+          path: "applications/runs/:runId/log",
+          element: <ApplicationRunLogRoute />,
         },
       ],
     },

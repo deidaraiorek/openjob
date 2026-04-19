@@ -48,6 +48,7 @@ const navigationItems = [
   { to: "/questions", label: "Questions" },
   { to: "/action-needed", label: "Action Needed" },
   { to: "/role-profile", label: "Profile" },
+  { to: "/system-log", label: "System Log" },
 ];
 
 export function AppLayout({ api }: AppLayoutProps) {

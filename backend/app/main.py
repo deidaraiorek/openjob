@@ -13,6 +13,7 @@ from app.domains.application_accounts.routes import router as application_accoun
 from app.domains.answers.routes import router as answers_router
 from app.domains.applications.routes import router as applications_router
 from app.domains.jobs.routes import router as jobs_router
+from app.domains.logs.routes import router as logs_router
 from app.domains.questions.routes import router as questions_router
 from app.domains.role_profiles.routes import router as role_profile_router
 from app.domains.sources.routes import router as sources_router
@@ -35,6 +36,7 @@ def ensure_database_ready() -> None:
         "apply_targets",
         "job_relevance_evaluations",
         "job_relevance_tasks",
+        "system_events",
     }
 
     if required_tables.issubset(existing_tables):
@@ -72,6 +74,7 @@ def create_app() -> FastAPI:
     app.include_router(questions_router, prefix="/api")
     app.include_router(jobs_router, prefix="/api")
     app.include_router(applications_router, prefix="/api")
+    app.include_router(logs_router, prefix="/api")
 
     @app.on_event("startup")
     def _resume_pending_relevance() -> None:

@@ -40,4 +40,6 @@ def classify_ai_browser_exception(error: Exception) -> Exception:
         return RetryableApplyError(msg)
     if "network" in lower or "connection" in lower:
         return RetryableApplyError(msg)
+    if "rate limit" in lower or "429" in lower or "ratelimit" in lower or "quota" in lower:
+        return RetryableApplyError(msg)
     return TerminalApplyError(msg)

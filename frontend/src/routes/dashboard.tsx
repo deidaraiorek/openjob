@@ -125,7 +125,7 @@ export function DashboardRoute() {
             <ul className="stack-list">
               {jobs.slice(0, 5).map((job) => (
                 <li key={job.id} className="stack-row">
-                  <div>
+                  <div className="dashboard-job-copy">
                     <strong>{job.company_name}</strong>
                     <span>{job.title}</span>
                   </div>

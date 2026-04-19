@@ -25,7 +25,8 @@ from app.domains.applications.retry_policy import (
     classify_apply_exception,
 )
 from app.domains.jobs.models import ApplyTarget, Job
-from app.domains.questions.matching import ensure_question_task, resolve_questions
+from app.domains.logs.service import log_system_event
+from app.domains.questions.matching import build_question_answer_map, ensure_question_task, resolve_questions
 from app.integrations.ai_browser.apply import execute_ai_browser_run
 from app.integrations.ashby import apply as ashby_apply
 from app.integrations.greenhouse import apply as greenhouse_apply
@@ -46,8 +47,16 @@ FetchQuestionsFn = Callable[[ApplyTarget], Any]
 SubmitFn = Callable[[ApplyTarget, dict[str, Any]], dict[str, Any]]
 
 
-def _log_event(run: ApplicationRun, event_type: str, payload: dict[str, Any]) -> None:
+def _log_event(run: ApplicationRun, event_type: str, payload: dict[str, Any], session: Session | None = None) -> None:
     run.events.append(ApplicationEvent(event_type=event_type, payload=payload))
+    if session is not None:
+        log_system_event(
+            session,
+            event_type=event_type,
+            source="application_run",
+            payload={"run_id": run.id, "job_id": run.job_id, **payload},
+            account_id=run.account_id,
+        )
 
 
 def _default_fetch_questions(apply_target: ApplyTarget):
@@ -224,6 +233,7 @@ def _execute_direct_api_application_run(
         run,
         "queued",
         {"apply_target_id": apply_target.id, "target_type": apply_target.target_type},
+        session,
     )
 
     fetcher = fetch_questions or _default_fetch_questions
@@ -232,7 +242,7 @@ def _execute_direct_api_application_run(
     try:
         question_payload = fetcher(apply_target)
         questions = _parse_questions(apply_target, question_payload)
-        _log_event(run, "questions_fetched", {"question_count": len(questions)})
+        _log_event(run, "questions_fetched", {"question_count": len(questions)}, session)
 
         resolved_questions = resolve_questions(session, account.id, questions)
         answer_entry_ids = [
@@ -241,20 +251,19 @@ def _execute_direct_api_application_run(
             if item.answer_entry is not None
         ]
 
-        unresolved_required = [
-            item for item in resolved_questions if item.question.required and item.answer_entry is None
+        unresolved = [item for item in resolved_questions if item.answer_entry is None]
+        unresolved_required = [item for item in unresolved if item.question.required]
+        task_ids = [
+            ensure_question_task(
+                session,
+                account_id=account.id,
+                job_id=job.id,
+                application_run_id=run.id,
+                resolved_question=item,
+            ).id
+            for item in unresolved
         ]
         if unresolved_required:
-            task_ids = [
-                ensure_question_task(
-                    session,
-                    account_id=account.id,
-                    job_id=job.id,
-                    application_run_id=run.id,
-                    resolved_question=item,
-                ).id
-                for item in unresolved_required
-            ]
             run.status = "blocked_missing_answer"
             run.completed_at = utcnow()
             _log_event(
@@ -262,8 +271,9 @@ def _execute_direct_api_application_run(
                 "blocked_missing_answer",
                 {
                     "question_task_ids": task_ids,
-                    "question_fingerprints": [item.fingerprint for item in unresolved_required],
+                    "question_answer_map": build_question_answer_map(resolved_questions),
                 },
+                session,
             )
             session.commit()
             return ApplyResult(
@@ -287,14 +297,17 @@ def _execute_direct_api_application_run(
         submit_response = submitter(apply_target, submission_payload)
         run.status = "submitted"
         run.completed_at = utcnow()
+        job.status = "applied"
         _log_event(
             run,
             "submitted",
             {
                 "answer_entry_ids": answer_entry_ids,
+                "question_answer_map": build_question_answer_map(resolved_questions),
                 "submission_payload": redacted_payload,
                 "submit_response": redact_payload(submit_response),
             },
+            session,
         )
         session.commit()
         return ApplyResult(
@@ -310,6 +323,7 @@ def _execute_direct_api_application_run(
                 run,
                 "browser_fallback_attempted",
                 {"reason": str(error), "target_type": apply_target.target_type},
+                session,
             )
             session.flush()
             ai_result = execute_ai_browser_run(
@@ -331,6 +345,7 @@ def _execute_direct_api_application_run(
             run,
             decision.status,
             {"message": str(error), "action_needed": decision.action_needed},
+            session,
         )
         session.commit()
         return ApplyResult(

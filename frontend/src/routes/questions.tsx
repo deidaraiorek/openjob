@@ -32,7 +32,7 @@ function isSingleSelectField(task: QuestionTask) {
   return (
     !isFileField(task)
     && !isMultiSelectField(task)
-    && (fieldType.includes("single_select") || fieldType.includes("radio"))
+    && (fieldType.includes("single_select") || fieldType.includes("radio") || fieldType === "select")
   );
 }
 
@@ -120,6 +120,19 @@ export function QuestionsRoute() {
       linked_answer_entry_id: answerEntryId,
     });
     await reloadData();
+  }
+
+  async function skipTask(taskId: number) {
+    setError(null);
+    setSavingTaskId(taskId);
+    try {
+      await api.resolveQuestionTask(taskId, { status: "resolved", linked_answer_entry_id: null });
+      await reloadData();
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "Unable to skip question.");
+    } finally {
+      setSavingTaskId(null);
+    }
   }
 
   function toggleRankedMode(taskId: number, options: string[]) {
@@ -351,7 +364,10 @@ export function QuestionsRoute() {
               return (
                 <li key={task.id} className="question-task-card">
                 <div>
-                  <strong>{task.prompt_text}</strong>
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}>
+                    <strong>{task.prompt_text}</strong>
+                    {!task.required ? <span style={{ fontSize: "0.72rem", fontWeight: 600, color: "#92400e", background: "#fffbeb", border: "1px solid #fde68a", borderRadius: "0.4rem", padding: "0.1rem 0.45rem", letterSpacing: "0.04em", textTransform: "uppercase" }}>Optional</span> : null}
+                  </div>
                   <p className="muted-copy">{describeFieldType(task)}</p>
                   {task.option_labels.length > 0 ? (
                     <ul className="question-option-list" aria-label={`Choices for task ${task.id}`}>
@@ -562,7 +578,7 @@ export function QuestionsRoute() {
                           <textarea
                             aria-label={`New answer text for task ${task.id}`}
                             className="question-inline-textarea"
-                            placeholder="Type the answer you want OpenJob to remember"
+                            placeholder={task.placeholder_text ?? "Type the answer you want OpenJob to remember"}
                             rows={3}
                             value={draftTexts[task.id] ?? ""}
                             onChange={(event) =>
@@ -576,14 +592,26 @@ export function QuestionsRoute() {
                         {selectedExistingAnswerId ? (
                           <p className="muted-copy">Selected saved answer: {describeAnswerOption(compatibleAnswers.find((answer) => answer.id === selectedExistingAnswerId)!)}</p>
                         ) : null}
-                        <button
-                          type="button"
-                          className="secondary-button"
-                          disabled={savingTaskId === task.id}
-                          onClick={() => rankedModeTaskIds.has(task.id) ? void saveRankedPreference(task) : void createAndLinkAnswer(task)}
-                        >
-                          {savingTaskId === task.id ? "Saving..." : rankedModeTaskIds.has(task.id) ? "Save ranked preference" : "Save and link"}
-                        </button>
+                        <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            disabled={savingTaskId === task.id}
+                            onClick={() => rankedModeTaskIds.has(task.id) ? void saveRankedPreference(task) : void createAndLinkAnswer(task)}
+                          >
+                            {savingTaskId === task.id ? "Saving..." : rankedModeTaskIds.has(task.id) ? "Save ranked preference" : "Save and link"}
+                          </button>
+                          {!task.required ? (
+                            <button
+                              type="button"
+                              className="ghost-button"
+                              disabled={savingTaskId === task.id}
+                              onClick={() => void skipTask(task.id)}
+                            >
+                              Skip
+                            </button>
+                          ) : null}
+                        </div>
                       </div>
                     </>
                   )}

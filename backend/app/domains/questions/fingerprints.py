@@ -11,6 +11,7 @@ class ApplyQuestion:
     field_type: str
     required: bool
     option_labels: list[str] = field(default_factory=list)
+    placeholder_text: str | None = None
 
 
 def normalize_question_text(value: str) -> str:

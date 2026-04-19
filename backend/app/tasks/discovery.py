@@ -44,7 +44,10 @@ from app.integrations.lever.client import parse_postings as parse_lever_postings
 from app.integrations.linkedin.discovery import parse_search_results as parse_linkedin_search_results
 from app.integrations.smartrecruiters.client import fetch_postings as fetch_smartrecruiters_postings
 from app.integrations.smartrecruiters.client import parse_postings as parse_smartrecruiters_postings
+from app.integrations.test_jobboard.client import fetch_jobs as fetch_test_jobboard_jobs
+from app.integrations.test_jobboard.client import parse_jobs as parse_test_jobboard_jobs
 from app.tasks.job_relevance import drain_relevance_tasks_for_account, drain_relevance_tasks_now
+from app.domains.logs.service import log_system_event
 HARD_REJECT_SCORE_THRESHOLD = 0.15
 
 
@@ -90,7 +93,8 @@ def _load_role_profile(session: Session, source: JobSource) -> RoleProfile | Non
 
 def load_candidates(source: JobSource, raw_payload: Any = None) -> list[DiscoveryCandidate]:
     if source.source_type == "github_curated":
-        markdown = raw_payload if raw_payload is not None else fetch_markdown(resolve_github_raw_url(source))
+        markdown = raw_payload if raw_payload is not None else fetch_markdown(
+            resolve_github_raw_url(source))
         return resolve_github_candidates(
             parse_markdown_jobs(markdown),
             settings=source.settings_json,
@@ -98,7 +102,8 @@ def load_candidates(source: JobSource, raw_payload: Any = None) -> list[Discover
 
     if source.source_type == "greenhouse_board":
         board_token = derive_greenhouse_board_token(source)
-        payload = raw_payload if raw_payload is not None else fetch_greenhouse_jobs(board_token)
+        payload = raw_payload if raw_payload is not None else fetch_greenhouse_jobs(
+            board_token)
         return parse_greenhouse_jobs(
             payload,
             board_token=board_token,
@@ -107,7 +112,8 @@ def load_candidates(source: JobSource, raw_payload: Any = None) -> list[Discover
 
     if source.source_type == "lever_postings":
         company_slug = derive_lever_company_slug(source)
-        payload = raw_payload if raw_payload is not None else fetch_lever_postings(company_slug)
+        payload = raw_payload if raw_payload is not None else fetch_lever_postings(
+            company_slug)
         return parse_lever_postings(
             payload,
             company_slug=company_slug,
@@ -117,7 +123,8 @@ def load_candidates(source: JobSource, raw_payload: Any = None) -> list[Discover
 
     if source.source_type == "ashby_board":
         organization_host_token = derive_ashby_organization_host_token(source)
-        payload = raw_payload if raw_payload is not None else fetch_ashby_postings(organization_host_token)
+        payload = raw_payload if raw_payload is not None else fetch_ashby_postings(
+            organization_host_token)
         return parse_ashby_postings(
             payload,
             organization_host_token=organization_host_token,
@@ -126,7 +133,8 @@ def load_candidates(source: JobSource, raw_payload: Any = None) -> list[Discover
 
     if source.source_type == "smartrecruiters_board":
         company_identifier = derive_smartrecruiters_company_identifier(source)
-        payload = raw_payload if raw_payload is not None else fetch_smartrecruiters_postings(company_identifier)
+        payload = raw_payload if raw_payload is not None else fetch_smartrecruiters_postings(
+            company_identifier)
         return parse_smartrecruiters_postings(
             payload,
             company_identifier=company_identifier,
@@ -135,8 +143,18 @@ def load_candidates(source: JobSource, raw_payload: Any = None) -> list[Discover
 
     if source.source_type == "linkedin_search":
         if raw_payload is None:
-            raise ValueError("LinkedIn discovery requires a browser-captured payload")
+            raise ValueError(
+                "LinkedIn discovery requires a browser-captured payload")
         return parse_linkedin_search_results(raw_payload)
+
+    if source.source_type == "test_jobboard":
+        base_url = source.base_url or "http://localhost:4000"
+        jobs = raw_payload if raw_payload is not None else fetch_test_jobboard_jobs(base_url)
+        return parse_test_jobboard_jobs(
+            jobs,
+            base_url=base_url,
+            company_name=source.settings_json.get("company_name", "NovaCorp"),
+        )
 
     raise ValueError(f"Unsupported source type: {source.source_type}")
 
@@ -177,7 +195,8 @@ def sync_source(session: Session, source_id: int, raw_payload: Any = None) -> di
     if not source.active:
         return empty_sync_summary()
 
-    account = ensure_account(session, source.account.email if source.account else "owner@example.com")
+    account = ensure_account(
+        session, source.account.email if source.account else "owner@example.com")
     profile = _load_role_profile(session, source)
     candidates = load_candidates(source, raw_payload=raw_payload)
     compatibility_summary = summarize_candidate_targets(candidates)
@@ -189,7 +208,8 @@ def sync_source(session: Session, source_id: int, raw_payload: Any = None) -> di
 
     for candidate in candidates:
         processed += 1
-        existing_job = resolve_existing_job(session, account, source, candidate)
+        existing_job = resolve_existing_job(
+            session, account, source, candidate)
         cached_result = None
         if existing_job is not None:
             cached_result = cached_relevance_for_job(
@@ -198,7 +218,8 @@ def sync_source(session: Session, source_id: int, raw_payload: Any = None) -> di
                 source_type=candidate.source_type,
                 apply_target_type=candidate.apply_target_type,
                 description_snippet=(
-                    " ".join(candidate.raw_payload.get("description", "").strip().split())[:800]
+                    " ".join(candidate.raw_payload.get(
+                        "description", "").strip().split())
                     if isinstance(candidate.raw_payload.get("description"), str)
                     else None
                 ),
@@ -209,7 +230,8 @@ def sync_source(session: Session, source_id: int, raw_payload: Any = None) -> di
                 session.delete(existing_job)
             continue
 
-        job, was_created = ingest_candidate(session, account, source, candidate)
+        job, was_created = ingest_candidate(
+            session, account, source, candidate)
         touched_job_ids.append(job.id)
         if cached_result is None:
             if not profile or not profile.prompt.strip():
@@ -255,14 +277,16 @@ def sync_source(session: Session, source_id: int, raw_payload: Any = None) -> di
     pending_title_screening = session.scalar(
         select(func.count(JobRelevanceTask.id)).where(
             JobRelevanceTask.account_id == account.id,
-            JobRelevanceTask.job_id.in_(touched_job_ids if touched_job_ids else [-1]),
+            JobRelevanceTask.job_id.in_(
+                touched_job_ids if touched_job_ids else [-1]),
             JobRelevanceTask.phase == "title_screening",
         )
     ) or 0
     pending_full_relevance = session.scalar(
         select(func.count(JobRelevanceTask.id)).where(
             JobRelevanceTask.account_id == account.id,
-            JobRelevanceTask.job_id.in_(touched_job_ids if touched_job_ids else [-1]),
+            JobRelevanceTask.job_id.in_(
+                touched_job_ids if touched_job_ids else [-1]),
             JobRelevanceTask.phase == "full_relevance",
         )
     ) or 0
@@ -282,7 +306,8 @@ def sync_source(session: Session, source_id: int, raw_payload: Any = None) -> di
 def sync_all_sources_now() -> list[dict[str, int]]:
     session_factory = get_session_factory()
     with session_factory() as session:
-        source_ids = session.scalars(select(JobSource.id).where(JobSource.active.is_(True))).all()
+        source_ids = session.scalars(
+            select(JobSource.id).where(JobSource.active.is_(True))).all()
         return [sync_source(session, source_id) for source_id in source_ids]
 
 
@@ -307,13 +332,37 @@ def sync_source_task(source_id: int) -> dict[str, int]:
         session.commit()
 
         try:
+            log_system_event(
+                session,
+                event_type="source_sync_started",
+                source="discovery",
+                account_id=source.account_id,
+                payload={"source_id": source_id, "source_type": source.source_type, "source_name": source.name},
+            )
+            session.commit()
             summary = sync_source(session, source_id)
             source.last_sync_summary_json = summary
             mark_source_synced(source)
+            log_system_event(
+                session,
+                event_type="source_sync_completed",
+                source="discovery",
+                account_id=source.account_id,
+                payload={"source_id": source_id, "source_type": source.source_type, "source_name": source.name, **summary},
+            )
             session.commit()
-        except Exception:
-            release_source_sync_lease(session, source_id=source_id)
-            session.commit()
+        except Exception as exc:
+            with session_factory() as err_session:
+                err_source = err_session.get(JobSource, source_id)
+                log_system_event(
+                    err_session,
+                    event_type="source_sync_failed",
+                    source="discovery",
+                    account_id=err_source.account_id if err_source else None,
+                    payload={"source_id": source_id, "error": str(exc)},
+                )
+                release_source_sync_lease(err_session, source_id=source_id)
+                err_session.commit()
             raise
 
         if summary["pending_title_screening"] or summary["pending_full_relevance"]:

@@ -384,7 +384,8 @@ def list_jobs(
             if preferred_target is not None
             else None
         )
-        latest_run = max(job.application_runs, key=lambda item: item.id, default=None)
+        submitted_run = next((r for r in sorted(job.application_runs, key=lambda r: r.id, reverse=True) if r.status == "submitted"), None)
+        latest_run = submitted_run or max(job.application_runs, key=lambda item: item.id, default=None)
         items.append(
             JobListItemResponse(
                 id=job.id,

@@ -1,4 +1,5 @@
 from app.domains.accounts.models import Account
+from app.domains.logs.models import SystemEvent
 from app.domains.application_accounts.models import ApplicationAccount
 from app.domains.applications.models import ApplicationEvent, ApplicationRun
 from app.domains.jobs.models import ApplyTarget, Job, JobRelevanceEvaluation, JobRelevanceTask, JobSighting
@@ -22,4 +23,5 @@ __all__ = [
     "QuestionTask",
     "QuestionTemplate",
     "RoleProfile",
+    "SystemEvent",
 ]

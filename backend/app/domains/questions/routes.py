@@ -24,6 +24,8 @@ class QuestionTaskResponse(BaseModel):
     prompt_text: str
     field_type: str
     option_labels: list[str]
+    placeholder_text: str | None
+    required: bool
     status: str
     linked_answer_entry_id: int | None
 
@@ -41,6 +43,8 @@ def serialize_question_task(task: QuestionTask) -> QuestionTaskResponse:
         prompt_text=task.prompt_text,
         field_type=task.field_type,
         option_labels=task.option_labels,
+        placeholder_text=task.placeholder_text,
+        required=task.required,
         status=task.status,
         linked_answer_entry_id=task.linked_answer_entry_id,
     )
@@ -108,6 +112,15 @@ def resolve_question_task(
                 linked_answer_entry_id=answer_entry.id,
                 resolved_at=datetime.now(UTC),
             )
+        )
+        session.execute(
+            update(QuestionAlias)
+            .where(
+                QuestionAlias.account_id == current_account.id,
+                QuestionAlias.source_fingerprint == task.question_fingerprint,
+                QuestionAlias.status == "suggested",
+            )
+            .values(status="rejected")
         )
 
     session.commit()

@@ -27,6 +27,7 @@ from app.domains.role_profiles.models import RoleProfile
 from app.db.session import get_session_factory
 from app.integrations.openai.job_relevance import classify_job_relevance_batch
 from app.integrations.openai.job_title_screening import classify_job_titles
+from app.domains.logs.service import log_system_event
 
 
 def rescore_job(session: Session, *, account_id: int, job_id: int) -> Job | None:
@@ -127,15 +128,21 @@ def _handle_pending_task_failure(
     task.last_failure_cause = failure_cause
     task.lease_expires_at = None
 
-    if is_transient_failure_cause(failure_cause):
+    if is_transient_failure_cause(failure_cause) or failure_cause == "provider_response_invalid":
         task.available_at = _next_retry_time(attempt_count=task.attempt_count)
         mark_job_pending(task.job, phase=task.phase, summary=pending_summary_for_phase(task.phase))
-        session.flush()
-        return False
-
-    if failure_cause == "provider_response_invalid":
-        task.available_at = _next_retry_time(attempt_count=task.attempt_count)
-        mark_job_pending(task.job, phase=task.phase, summary=pending_summary_for_phase(task.phase))
+        log_system_event(
+            session,
+            event_type="ai_provider_error",
+            source="relevance",
+            account_id=account_id,
+            payload={
+                "job_id": task.job.id,
+                "phase": task.phase,
+                "failure_cause": failure_cause,
+                "attempt_count": task.attempt_count,
+            },
+        )
         session.flush()
         return False
 
@@ -218,9 +225,34 @@ def _process_title_screening_tasks(
                     result=title_screen_reject_result(task.job.title, screening),
                     profile=profile,
                 )
+                log_system_event(
+                    session,
+                    event_type="title_screen_rejected",
+                    source="relevance",
+                    account_id=account_id,
+                    payload={
+                        "job_id": task.job.id,
+                        "title": task.job.title,
+                        "summary": screening.summary,
+                        "model_name": screening.model_name,
+                        "decision_rationale_type": item.decision_rationale_type,
+                    },
+                )
                 delete_relevance_task(session, task)
                 continue
 
+            log_system_event(
+                session,
+                event_type="title_screen_passed",
+                source="relevance",
+                account_id=account_id,
+                payload={
+                    "job_id": task.job.id,
+                    "title": task.job.title,
+                    "summary": screening.summary,
+                    "model_name": screening.model_name,
+                },
+            )
             mark_job_pending(task.job, phase="full_relevance")
             upsert_relevance_task(
                 session,
@@ -281,6 +313,23 @@ def _process_full_relevance_tasks(
                 job=task.job,
                 result=result,
                 profile=profile,
+            )
+            log_system_event(
+                session,
+                event_type="full_relevance_evaluated",
+                source="relevance",
+                account_id=account_id,
+                payload={
+                    "job_id": task.job.id,
+                    "title": task.job.title,
+                    "company_name": task.job.company_name,
+                    "decision": result.decision,
+                    "score": result.score,
+                    "summary": result.summary,
+                    "model_name": result.model_name,
+                    "matched_signals": result.matched_signals,
+                    "concerns": result.concerns,
+                },
             )
             delete_relevance_task(session, task)
         session.commit()

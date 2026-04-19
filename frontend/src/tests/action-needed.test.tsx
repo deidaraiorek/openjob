@@ -140,6 +140,8 @@ function buildApi(): AppApi {
         artifact_paths: ["/tmp/openjob/run-3/page_html.html"],
       },
     ],
+    listSystemEvents: async () => [],
+    getApplicationRunLog: async () => ({ application_run_id: 0, job_id: 0, status: "", apply_target_type: null, started_at: "", completed_at: null, events: [], question_answer_map: [] }),
   };
 }
 

@@ -130,6 +130,8 @@ function buildApi(authenticated: boolean): AppApi {
     listActionNeeded: async () => [],
     listQuestionAliases: async () => [],
     updateQuestionAlias: async () => ({ id: 0, source_fingerprint: "", canonical_fingerprint: "", source_prompt: "", canonical_prompt: "", status: "rejected", similarity_score: 0 }),
+    listSystemEvents: async () => [],
+    getApplicationRunLog: async () => ({ application_run_id: 0, job_id: 0, status: "", apply_target_type: null, started_at: "", completed_at: null, events: [], question_answer_map: [] }),
   };
 }
 

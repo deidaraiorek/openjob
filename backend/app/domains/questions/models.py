@@ -26,6 +26,7 @@ class QuestionTemplate(TimestampMixin, Base):
     prompt_text: Mapped[str] = mapped_column()
     field_type: Mapped[str] = mapped_column(String(80))
     option_labels: Mapped[list[str]] = mapped_column(JSON, default=list)
+    placeholder_text: Mapped[str | None] = mapped_column(nullable=True)
 
     account = relationship("Account", back_populates="question_templates")
     answer_entries = relationship("AnswerEntry", back_populates="question_template")
@@ -72,6 +73,8 @@ class QuestionTask(TimestampMixin, Base):
     prompt_text: Mapped[str] = mapped_column()
     field_type: Mapped[str] = mapped_column(String(80))
     option_labels: Mapped[list[str]] = mapped_column(JSON, default=list)
+    placeholder_text: Mapped[str | None] = mapped_column(nullable=True)
+    required: Mapped[bool] = mapped_column(default=True)
     status: Mapped[str] = mapped_column(String(50), default="new")
     notes: Mapped[str | None] = mapped_column(nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(nullable=True)

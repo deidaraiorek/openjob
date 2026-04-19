@@ -119,6 +119,8 @@ export type QuestionTask = {
   prompt_text: string;
   field_type: string;
   option_labels: string[];
+  placeholder_text: string | null;
+  required: boolean;
   status: string;
   linked_answer_entry_id: number | null;
 };
@@ -269,6 +271,46 @@ export type JobRelevanceUpdateResult = {
   pending_relevance_next_retry_at?: string | null;
 };
 
+export type SystemEvent = {
+  id: number;
+  account_id: number | null;
+  event_type: string;
+  source: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+export type QuestionAnswerEntry = {
+  question_fingerprint: string;
+  prompt_text: string;
+  field_type: string;
+  required: boolean;
+  option_labels: string[];
+  placeholder_text: string | null;
+  match_source: string;
+  answer_entry_id: number | null;
+  answer_label: string | null;
+  answer_value: unknown;
+};
+
+export type ApplicationEventLog = {
+  id: number;
+  event_type: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
+export type ApplicationRunLog = {
+  application_run_id: number;
+  job_id: number;
+  status: string;
+  apply_target_type: string | null;
+  started_at: string;
+  completed_at: string | null;
+  events: ApplicationEventLog[];
+  question_answer_map: QuestionAnswerEntry[];
+};
+
 export type ActionNeededItem = {
   application_run_id: number;
   job_id: number;
@@ -328,7 +370,10 @@ export interface AppApi extends AuthApi {
   updateJobRelevance(jobId: number, payload: JobRelevanceUpdatePayload): Promise<JobRelevanceUpdateResult>;
   rescoreJob(jobId: number): Promise<JobRelevanceUpdateResult>;
   triggerJobApplication(jobId: number): Promise<TriggerApplicationRunResult>;
+  confirmRun(runId: number, action: "submit" | "answer_optional"): Promise<{ application_run_id: number; status: string; created_question_task_ids: number[] }>;
   listActionNeeded(): Promise<ActionNeededItem[]>;
+  listSystemEvents(params?: { source?: string; eventType?: string; limit?: number; offset?: number }): Promise<SystemEvent[]>;
+  getApplicationRunLog(runId: number): Promise<ApplicationRunLog>;
 }
 
 const baseUrl = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
@@ -537,8 +582,26 @@ export const apiClient: AppApi = {
       method: "POST",
     });
   },
+  confirmRun(runId, action) {
+    return request<{ application_run_id: number; status: string; created_question_task_ids: number[] }>(
+      `/api/applications/runs/${runId}/confirm`,
+      { method: "POST", body: JSON.stringify({ action }) },
+    );
+  },
   listActionNeeded() {
     return request<ActionNeededItem[]>("/api/applications/action-needed");
+  },
+  listSystemEvents(params = {}) {
+    const query = new URLSearchParams();
+    if (params.source) query.set("source", params.source);
+    if (params.eventType) query.set("event_type", params.eventType);
+    if (params.limit !== undefined) query.set("limit", String(params.limit));
+    if (params.offset !== undefined) query.set("offset", String(params.offset));
+    const qs = query.toString();
+    return request<SystemEvent[]>(`/api/logs/system${qs ? `?${qs}` : ""}`);
+  },
+  getApplicationRunLog(runId) {
+    return request<ApplicationRunLog>(`/api/applications/runs/${runId}/log`);
   },
   listQuestionAliases(status = "suggested") {
     return request<QuestionAlias[]>(`/api/questions/aliases?status=${encodeURIComponent(status)}`);

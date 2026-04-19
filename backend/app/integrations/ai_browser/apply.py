@@ -17,7 +17,8 @@ from app.domains.applications.redaction import redact_payload
 from app.domains.applications.retry_policy import RetryableApplyError, TerminalApplyError, classify_apply_exception
 from app.domains.jobs.models import ApplyTarget, Job
 from app.domains.questions.fingerprints import ApplyQuestion
-from app.domains.questions.matching import ensure_question_task, resolve_questions
+from app.domains.questions.matching import build_question_answer_map, ensure_question_task, resolve_questions
+from app.domains.logs.service import log_system_event
 from app.integrations.ai_browser.blockers import AIBrowserBlocker, classify_ai_browser_exception
 from app.integrations.linkedin.artifacts import persist_artifacts
 from app.integrations.linkedin.session_store import ensure_profile_dir
@@ -28,6 +29,7 @@ class ExtractedField(BaseModel):
     field_type: str
     required: bool
     options: list[str] = Field(default_factory=list)
+    placeholder: str | None = None
 
 
 class InspectOutput(BaseModel):
@@ -42,8 +44,16 @@ class AIBrowserResult:
     created_question_task_ids: list[int]
 
 
-def _log_event(run: ApplicationRun, event_type: str, payload: dict[str, Any]) -> None:
+def _log_event(run: ApplicationRun, event_type: str, payload: dict[str, Any], session: Session | None = None) -> None:
     run.events.append(ApplicationEvent(event_type=event_type, payload=payload))
+    if session is not None:
+        log_system_event(
+            session,
+            event_type=event_type,
+            source="application_run",
+            payload={"run_id": run.id, "job_id": run.job_id, **payload},
+            account_id=run.account_id,
+        )
 
 
 def _build_llm(settings: Settings):
@@ -80,7 +90,8 @@ def _credential_block(credential: str | None) -> str:
     )
 
 
-_OPTIONAL_URL_FIELD_KEYWORDS = {"linkedin", "twitter", "github", "portfolio", "website", "url", "blog", "other link"}
+_OPTIONAL_URL_FIELD_KEYWORDS = {
+    "linkedin", "twitter", "github", "portfolio", "website", "url", "blog", "other link"}
 
 
 def _build_inspect_task(url: str, credential: str | None) -> str:
@@ -93,9 +104,8 @@ def _build_inspect_task(url: str, credential: str | None) -> str:
         "- required: true for ANY field that the applicant must answer to successfully submit — "
         "this includes fields marked with *, fields that are substantive questions (work authorization, "
         "location preferences, employment type, eligibility questions), and file uploads. "
-        "Mark required: false ONLY for clearly optional fields like LinkedIn URL, GitHub URL, portfolio, "
-        "Twitter, phone, current company, and EEO/diversity voluntary fields.\n"
-        "- options: list of option labels for select/radio/checkbox fields, empty list otherwise\n\n"
+        "- options: list of option labels for select/radio/checkbox fields, empty list otherwise\n"
+        "- placeholder: the placeholder text shown inside the input field, or null if there is none\n\n"
         "If the form has multiple steps or pages, navigate through all steps to discover all fields "
         "but do NOT fill anything in.\n\n"
         "Return the complete list of fields as structured output."
@@ -145,7 +155,8 @@ def _run_inspect_agent(url: str, credential: str | None, settings: Settings) -> 
 
     raw = history.final_result()
     if not raw:
-        structured = history.structured_output() if hasattr(history, "structured_output") else None
+        structured_fn = getattr(history, "structured_output", None)
+        structured = structured_fn() if callable(structured_fn) else None
         if not structured:
             raise AIBrowserBlocker(
                 code="no_form_found",
@@ -155,7 +166,8 @@ def _run_inspect_agent(url: str, credential: str | None, settings: Settings) -> 
         raw = structured
 
     try:
-        output = InspectOutput.model_validate_json(raw) if isinstance(raw, str) else InspectOutput.model_validate(raw)
+        output = InspectOutput.model_validate_json(raw) if isinstance(
+            raw, str) else InspectOutput.model_validate(raw)
     except Exception:
         raise AIBrowserBlocker(
             code="no_form_found",
@@ -173,16 +185,21 @@ def _run_inspect_agent(url: str, credential: str | None, settings: Settings) -> 
     questions = []
     for q in output.questions:
         label_lower = q.label.lower()
-        is_optional_url = any(kw in label_lower for kw in _OPTIONAL_URL_FIELD_KEYWORDS)
-        is_eeo_voluntary = any(kw in label_lower for kw in {"gender", "race", "ethnicity", "veteran", "disability", "eeo", "diversity"})
-        is_substantive_choice = q.field_type in {"radio", "select", "checkbox"} and len(q.options) > 0
-        required = q.required or (is_substantive_choice and not is_optional_url and not is_eeo_voluntary)
+        is_optional_url = any(
+            kw in label_lower for kw in _OPTIONAL_URL_FIELD_KEYWORDS)
+        is_eeo_voluntary = any(kw in label_lower for kw in {
+                               "gender", "race", "ethnicity", "veteran", "disability", "eeo", "diversity"})
+        is_substantive_choice = q.field_type in {
+            "radio", "select", "checkbox"} and len(q.options) > 0
+        required = q.required or (
+            is_substantive_choice and not is_optional_url and not is_eeo_voluntary)
         questions.append(ApplyQuestion(
             key=q.label.lower().replace(" ", "_")[:64],
             prompt_text=q.label,
             field_type=q.field_type,
             required=required,
             option_labels=q.options,
+            placeholder_text=q.placeholder or None,
         ))
     return questions
 
@@ -217,7 +234,8 @@ def _select_target(job: Job, destination_url: str | None) -> ApplyTarget:
         for t in job.apply_targets:
             if t.destination_url == destination_url:
                 return t
-        raise TerminalApplyError(f"No apply target found with destination URL: {destination_url}")
+        raise TerminalApplyError(
+            f"No apply target found with destination URL: {destination_url}")
     preferred = next((t for t in job.apply_targets if t.is_preferred), None)
     if preferred:
         return preferred
@@ -263,34 +281,38 @@ def execute_ai_browser_run(
         _log_event(
             run,
             "queued",
-            {"apply_target_id": apply_target.id, "target_type": apply_target.target_type, "driver": "ai_browser"},
+            {"apply_target_id": apply_target.id,
+                "target_type": apply_target.target_type, "driver": "ai_browser"},
+            session,
         )
 
-    profile_dir = ensure_profile_dir(account.id, "ai_browser", settings=resolved_settings)
+    profile_dir = ensure_profile_dir(
+        account.id, "ai_browser", settings=resolved_settings)
 
     try:
-        questions = _run_inspect_agent(resolved_url, credential, resolved_settings)
-        _log_event(run, "questions_fetched", {"question_count": len(questions), "driver": "ai_browser"})
+        questions = _run_inspect_agent(
+            resolved_url, credential, resolved_settings)
+        _log_event(run, "questions_fetched", {
+                   "question_count": len(questions), "driver": "ai_browser"}, session)
 
         resolved_questions = resolve_questions(session, account.id, questions)
         answer_entry_ids = [
             item.answer_entry.id for item in resolved_questions if item.answer_entry is not None
         ]
-        unresolved_required = [
-            item for item in resolved_questions if item.question.required and item.answer_entry is None
+        unresolved = [item for item in resolved_questions if item.answer_entry is None]
+        unresolved_required = [item for item in unresolved if item.question.required]
+        task_ids = [
+            ensure_question_task(
+                session,
+                account_id=account.id,
+                job_id=job.id,
+                application_run_id=run.id,
+                resolved_question=item,
+            ).id
+            for item in unresolved
         ]
 
         if unresolved_required:
-            task_ids = [
-                ensure_question_task(
-                    session,
-                    account_id=account.id,
-                    job_id=job.id,
-                    application_run_id=run.id,
-                    resolved_question=item,
-                ).id
-                for item in unresolved_required
-            ]
             run.status = "blocked_missing_answer"
             run.completed_at = utcnow()
             _log_event(
@@ -298,8 +320,9 @@ def execute_ai_browser_run(
                 "blocked_missing_answer",
                 {
                     "question_task_ids": task_ids,
-                    "question_fingerprints": [item.fingerprint for item in unresolved_required],
+                    "question_answer_map": build_question_answer_map(resolved_questions),
                 },
+                session,
             )
             session.commit()
             return AIBrowserResult(
@@ -315,17 +338,21 @@ def execute_ai_browser_run(
             if item.answer_entry is not None
         }
 
-        submit_result = _run_submit_agent(resolved_url, answers_by_key, credential, resolved_settings)
+        submit_result = _run_submit_agent(
+            resolved_url, answers_by_key, credential, resolved_settings)
         run.status = "submitted"
         run.completed_at = utcnow()
+        job.status = "applied"
         _log_event(
             run,
             "submitted",
             {
                 "answer_entry_ids": answer_entry_ids,
+                "question_answer_map": build_question_answer_map(resolved_questions),
                 "driver": "ai_browser",
                 "submit_result": redact_payload(submit_result),
             },
+            session,
         )
         session.commit()
         return AIBrowserResult(
@@ -355,6 +382,7 @@ def execute_ai_browser_run(
                 "message": str(error),
                 "artifacts": artifacts,
             },
+            session,
         )
         session.commit()
         return AIBrowserResult(

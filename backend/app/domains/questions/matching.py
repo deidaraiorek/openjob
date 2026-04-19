@@ -19,6 +19,7 @@ class ResolvedQuestion:
     fingerprint: str
     template: QuestionTemplate
     answer_entry: AnswerEntry | None
+    match_source: str = "exact_match"
 
     @property
     def answer_value(self):
@@ -105,6 +106,7 @@ def ensure_question_template(
         prompt_text=question.prompt_text,
         field_type=question.field_type,
         option_labels=question.option_labels,
+        placeholder_text=question.placeholder_text,
     )
     session.add(template)
     session.flush()
@@ -139,8 +141,11 @@ def resolve_questions(
     resolved: list[ResolvedQuestion] = []
 
     for question in questions:
-        canonical_fingerprint = resolve_alias(session, account_id, fingerprint_apply_question(question))
-        if canonical_fingerprint != fingerprint_apply_question(question):
+        raw_fingerprint = fingerprint_apply_question(question)
+        canonical_fingerprint = resolve_alias(session, account_id, raw_fingerprint)
+        via_alias = canonical_fingerprint != raw_fingerprint
+
+        if via_alias:
             template = session.scalar(
                 select(QuestionTemplate).where(
                     QuestionTemplate.account_id == account_id,
@@ -149,6 +154,7 @@ def resolve_questions(
             ) or ensure_question_template(session, account_id, question)
         else:
             template = ensure_question_template(session, account_id, question)
+
         answer_entry = session.scalar(
             select(AnswerEntry)
             .where(
@@ -158,8 +164,15 @@ def resolve_questions(
             .order_by(AnswerEntry.created_at.desc()),
         )
 
-        if answer_entry and "ranked_options" in (answer_entry.answer_payload or {}):
-            answer_entry = _resolve_ranked_answer(answer_entry, question.option_labels)
+        match_source = "unresolved"
+        if answer_entry:
+            if "ranked_options" in (answer_entry.answer_payload or {}):
+                answer_entry = _resolve_ranked_answer(answer_entry, question.option_labels)
+                match_source = "ranked_option" if answer_entry else "unresolved"
+            elif via_alias:
+                match_source = "alias_match"
+            else:
+                match_source = "exact_match"
 
         resolved.append(
             ResolvedQuestion(
@@ -167,6 +180,7 @@ def resolve_questions(
                 fingerprint=template.fingerprint,
                 template=template,
                 answer_entry=answer_entry,
+                match_source=match_source,
             ),
         )
 
@@ -194,6 +208,9 @@ def ensure_question_task(
         existing.prompt_text = resolved_question.question.prompt_text
         existing.field_type = resolved_question.question.field_type
         existing.option_labels = resolved_question.question.option_labels
+        existing.required = resolved_question.question.required
+        if resolved_question.question.placeholder_text:
+            existing.placeholder_text = resolved_question.question.placeholder_text
         return existing
 
     task = QuestionTask(
@@ -205,12 +222,33 @@ def ensure_question_task(
         prompt_text=resolved_question.question.prompt_text,
         field_type=resolved_question.question.field_type,
         option_labels=resolved_question.question.option_labels,
+        placeholder_text=resolved_question.question.placeholder_text,
+        required=resolved_question.question.required,
         status="new",
         resolved_at=None,
     )
     session.add(task)
     session.flush()
     return task
+
+
+def build_question_answer_map(resolved_questions: list[ResolvedQuestion]) -> list[dict]:
+    result = []
+    for item in resolved_questions:
+        entry = item.answer_entry
+        result.append({
+            "question_fingerprint": item.fingerprint,
+            "prompt_text": item.question.prompt_text,
+            "field_type": item.question.field_type,
+            "required": item.question.required,
+            "option_labels": item.question.option_labels,
+            "placeholder_text": item.question.placeholder_text,
+            "match_source": item.match_source,
+            "answer_entry_id": entry.id if entry and entry.id else None,
+            "answer_label": entry.label if entry else None,
+            "answer_value": item.answer_value,
+        })
+    return result
 
 
 def mark_question_task_resolved(session: Session, task: QuestionTask, answer_entry: AnswerEntry) -> None:
