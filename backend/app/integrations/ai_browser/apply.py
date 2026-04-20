@@ -23,6 +23,24 @@ from app.integrations.ai_browser.blockers import AIBrowserBlocker, classify_ai_b
 from app.integrations.linkedin.artifacts import persist_artifacts
 from app.integrations.linkedin.session_store import ensure_profile_dir
 
+_DOM_STRIP_JS = """
+() => {
+    const selectors = [
+        'nav', 'header', 'footer', 'aside',
+        'script', 'style', 'noscript',
+        '[role="banner"]', '[role="navigation"]', '[role="contentinfo"]',
+        '[aria-hidden="true"]',
+        '.cookie-banner', '.cookie-notice', '#cookie-banner',
+        '.ad', '.ads', '.advertisement',
+        '.sidebar', '#sidebar',
+        '.social-share', '.share-buttons',
+    ];
+    for (const sel of selectors) {
+        document.querySelectorAll(sel).forEach(el => el.remove());
+    }
+}
+"""
+
 
 class ExtractedField(BaseModel):
     label: str
@@ -59,11 +77,8 @@ def _log_event(run: ApplicationRun, event_type: str, payload: dict[str, Any], se
 def _build_llm(settings: Settings):
     from browser_use.llm.openai.chat import ChatOpenAI
     if settings.groq_api_key:
-        # Groq's API doesn't support OpenAI's json_schema response_format with strict mode.
-        # We disable forced structured output and put the schema in the system prompt instead,
-        # then parse the raw text response ourselves.
         return ChatOpenAI(
-            model=settings.groq_model,
+            model=settings.groq_browser_model,
             api_key=settings.groq_api_key,
             base_url=settings.groq_base_url,
             dont_force_structured_output=True,
@@ -131,8 +146,35 @@ def _build_submit_task(url: str, answers_by_key: dict[str, Any], credential: str
     )
 
 
+def _build_combined_task(url: str, answers_by_key: dict[str, Any], credential: str | None) -> str:
+    answers_json = json.dumps(answers_by_key, indent=2)
+    return (
+        f"Navigate to this job application page: {url}\n\n"
+        "Your task is to fill in and submit the job application form using ONLY the answers provided below.\n\n"
+        f"Available answers:\n{answers_json}\n\n"
+        "IMPORTANT RULES:\n"
+        "- Do NOT fill any field for which you do not have a provided answer\n"
+        "- Do NOT invent, guess, or hallucinate any values\n"
+        "- Match each answer to the form field by its label or purpose\n"
+        "- For multi-step forms, complete each step in order and click Next/Continue to advance\n"
+        "- After filling all available fields, click the final Submit button\n"
+        "- If you encounter a CAPTCHA, stop and report it\n\n"
+        "Complete the submission."
+        + _credential_block(credential)
+    )
+
+
 def _run_sync(coro) -> Any:
     return asyncio.run(coro)
+
+
+async def _strip_dom(agent) -> None:
+    try:
+        page = await agent.browser_session.get_current_page()
+        if page:
+            await page.evaluate(_DOM_STRIP_JS)
+    except Exception:
+        pass
 
 
 def _run_inspect_agent(url: str, credential: str | None, settings: Settings) -> list[ApplyQuestion]:
@@ -149,7 +191,7 @@ def _run_inspect_agent(url: str, credential: str | None, settings: Settings) -> 
             browser=browser,
             output_model_schema=InspectOutput,
         )
-        return await agent.run(max_steps=50)
+        return await agent.run(max_steps=50, on_step_start=_strip_dom)
 
     history = _run_sync(_run())
 
@@ -182,26 +224,7 @@ def _run_inspect_agent(url: str, credential: str | None, settings: Settings) -> 
             message="AI browser agent found zero form fields.",
         )
 
-    questions = []
-    for q in output.questions:
-        label_lower = q.label.lower()
-        is_optional_url = any(
-            kw in label_lower for kw in _OPTIONAL_URL_FIELD_KEYWORDS)
-        is_eeo_voluntary = any(kw in label_lower for kw in {
-                               "gender", "race", "ethnicity", "veteran", "disability", "eeo", "diversity"})
-        is_substantive_choice = q.field_type in {
-            "radio", "select", "checkbox"} and len(q.options) > 0
-        required = q.required or (
-            is_substantive_choice and not is_optional_url and not is_eeo_voluntary)
-        questions.append(ApplyQuestion(
-            key=q.label.lower().replace(" ", "_")[:64],
-            prompt_text=q.label,
-            field_type=q.field_type,
-            required=required,
-            option_labels=q.options,
-            placeholder_text=q.placeholder or None,
-        ))
-    return questions
+    return _parse_extracted_fields(output.questions)
 
 
 def _run_submit_agent(
@@ -222,11 +245,59 @@ def _run_submit_agent(
             llm=llm,
             browser=browser,
         )
-        return await agent.run(max_steps=100)
+        return await agent.run(max_steps=100, on_step_start=_strip_dom)
 
     history = _run_sync(_run())
 
     return {"action_count": len(history.action_names()), "final_result": history.final_result()}
+
+
+def _run_combined_agent(
+    url: str,
+    answers_by_key: dict[str, Any],
+    credential: str | None,
+    settings: Settings,
+) -> dict[str, Any]:
+    from browser_use import Agent, Browser
+
+    llm = _build_llm(settings)
+    task = _build_combined_task(url, answers_by_key, credential)
+
+    async def _run():
+        browser = Browser(headless=settings.playwright_headless)
+        agent = Agent(
+            task=task,
+            llm=llm,
+            browser=browser,
+        )
+        return await agent.run(max_steps=100, on_step_start=_strip_dom)
+
+    history = _run_sync(_run())
+
+    return {"action_count": len(history.action_names()), "final_result": history.final_result()}
+
+
+def _parse_extracted_fields(fields: list[ExtractedField]) -> list[ApplyQuestion]:
+    questions = []
+    for q in fields:
+        label_lower = q.label.lower()
+        is_optional_url = any(
+            kw in label_lower for kw in _OPTIONAL_URL_FIELD_KEYWORDS)
+        is_eeo_voluntary = any(kw in label_lower for kw in {
+                               "gender", "race", "ethnicity", "veteran", "disability", "eeo", "diversity"})
+        is_substantive_choice = q.field_type in {
+            "radio", "select", "checkbox"} and len(q.options) > 0
+        required = q.required or (
+            is_substantive_choice and not is_optional_url and not is_eeo_voluntary)
+        questions.append(ApplyQuestion(
+            key=q.label.lower().replace(" ", "_")[:64],
+            prompt_text=q.label,
+            field_type=q.field_type,
+            required=required,
+            option_labels=q.options,
+            placeholder_text=q.placeholder or None,
+        ))
+    return questions
 
 
 def _select_target(job: Job, destination_url: str | None) -> ApplyTarget:
@@ -338,7 +409,7 @@ def execute_ai_browser_run(
             if item.answer_entry is not None
         }
 
-        submit_result = _run_submit_agent(
+        submit_result = _run_combined_agent(
             resolved_url, answers_by_key, credential, resolved_settings)
         run.status = "submitted"
         run.completed_at = utcnow()
