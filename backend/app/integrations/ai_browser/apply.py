@@ -26,7 +26,7 @@ from app.integrations.linkedin.session_store import ensure_profile_dir
 _DOM_STRIP_JS = """
 () => {
     const selectors = [
-        'nav', 'header', 'footer', 'aside',
+        'nav', 'aside',
         'script', 'style', 'noscript',
         '[role="banner"]', '[role="navigation"]', '[role="contentinfo"]',
         '[aria-hidden="true"]',
@@ -146,24 +146,6 @@ def _build_submit_task(url: str, answers_by_key: dict[str, Any], credential: str
     )
 
 
-def _build_combined_task(url: str, answers_by_key: dict[str, Any], credential: str | None) -> str:
-    answers_json = json.dumps(answers_by_key, indent=2)
-    return (
-        f"Navigate to this job application page: {url}\n\n"
-        "Your task is to fill in and submit the job application form using ONLY the answers provided below.\n\n"
-        f"Available answers:\n{answers_json}\n\n"
-        "IMPORTANT RULES:\n"
-        "- Do NOT fill any field for which you do not have a provided answer\n"
-        "- Do NOT invent, guess, or hallucinate any values\n"
-        "- Match each answer to the form field by its label or purpose\n"
-        "- For multi-step forms, complete each step in order and click Next/Continue to advance\n"
-        "- After filling all available fields, click the final Submit button\n"
-        "- If you encounter a CAPTCHA, stop and report it\n\n"
-        "Complete the submission."
-        + _credential_block(credential)
-    )
-
-
 def _run_sync(coro) -> Any:
     return asyncio.run(coro)
 
@@ -237,31 +219,6 @@ def _run_submit_agent(
 
     llm = _build_llm(settings)
     task = _build_submit_task(url, answers_by_key, credential)
-
-    async def _run():
-        browser = Browser(headless=settings.playwright_headless)
-        agent = Agent(
-            task=task,
-            llm=llm,
-            browser=browser,
-        )
-        return await agent.run(max_steps=100, on_step_start=_strip_dom)
-
-    history = _run_sync(_run())
-
-    return {"action_count": len(history.action_names()), "final_result": history.final_result()}
-
-
-def _run_combined_agent(
-    url: str,
-    answers_by_key: dict[str, Any],
-    credential: str | None,
-    settings: Settings,
-) -> dict[str, Any]:
-    from browser_use import Agent, Browser
-
-    llm = _build_llm(settings)
-    task = _build_combined_task(url, answers_by_key, credential)
 
     async def _run():
         browser = Browser(headless=settings.playwright_headless)
@@ -409,7 +366,7 @@ def execute_ai_browser_run(
             if item.answer_entry is not None
         }
 
-        submit_result = _run_combined_agent(
+        submit_result = _run_submit_agent(
             resolved_url, answers_by_key, credential, resolved_settings)
         run.status = "submitted"
         run.completed_at = utcnow()
