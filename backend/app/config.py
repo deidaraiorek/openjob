@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     answer_file_storage_dir: str = "/tmp/openjob-answer-files"
     groq_api_key: str | None = None
     groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
+    groq_browser_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
     groq_title_screening_model: str | None = "meta-llama/llama-4-scout-17b-16e-instruct"
     groq_job_relevance_model: str | None = "meta-llama/llama-4-scout-17b-16e-instruct"
     groq_base_url: str = "https://api.groq.com/openai/v1"
