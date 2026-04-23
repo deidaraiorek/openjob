@@ -46,15 +46,6 @@ def _best_answer(label: str, answers: dict[str, Any]) -> Any | None:
     for key, val in answers.items():
         if key.lower().strip() == label_lower:
             return val
-    best_score = 0.0
-    best_val = None
-    for key, val in answers.items():
-        score = difflib.SequenceMatcher(None, label_lower, key.lower().strip()).ratio()
-        if score > best_score:
-            best_score = score
-            best_val = val
-    if best_score >= _LABEL_SIMILARITY_THRESHOLD:
-        return best_val
     return None
 
 

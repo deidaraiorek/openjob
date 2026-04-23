@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import Settings, get_settings
@@ -212,7 +212,7 @@ def _parse_extracted_fields(fields: list[ExtractedField]) -> list[ApplyQuestion]
     return questions
 
 
-def _run_dom_apply(url: str, answers_by_key: dict[str, Any], credential: str | None, settings: Settings) -> ApplyOutput:
+def _run_dom_apply(url: str, answers_by_key: dict[str, Any], settings: Settings) -> ApplyOutput:
     from playwright.sync_api import sync_playwright
     from app.integrations.browser_context import _CHROMIUM_ARGS, _NAVIGATOR_WEBDRIVER_SCRIPT
 
@@ -224,10 +224,8 @@ def _run_dom_apply(url: str, answers_by_key: dict[str, Any], credential: str | N
         page = context.new_page()
 
         try:
-            page.goto(url, wait_until="networkidle")
-
-            if credential:
-                pass
+            page.goto(url, wait_until="domcontentloaded")
+            page.wait_for_selector("input, select, textarea", timeout=10_000)
 
             result = fill_and_submit(page, answers_by_key)
 
@@ -313,9 +311,10 @@ def execute_ai_browser_run(
 
         if ats_is_supported(resolved_url):
             try:
-                result = _run_dom_apply(resolved_url, answers_by_key, credential, resolved_settings)
+                result = _run_dom_apply(resolved_url, answers_by_key, resolved_settings)
                 _log_event(run, "dom_apply_attempted", {"driver": "dom_scraper", "url": resolved_url}, session)
-            except Exception:
+            except Exception as e:
+                _log_event(run, "dom_apply_failed", {"error": str(e), "driver": "dom_scraper"}, session)
                 result = _run_apply_agent(resolved_url, answers_by_key, credential, resolved_settings)
                 _log_event(run, "dom_apply_fallback", {"driver": "ai_browser", "url": resolved_url}, session)
         else:
@@ -410,22 +409,27 @@ def execute_ai_browser_run(
 
 def _load_all_answers(session: Session, account_id: int) -> dict[str, Any]:
     from app.domains.questions.models import AnswerEntry, QuestionTemplate
+
+    latest = (
+        select(
+            AnswerEntry.question_template_id,
+            func.max(AnswerEntry.created_at).label("max_created_at"),
+        )
+        .where(AnswerEntry.account_id == account_id)
+        .group_by(AnswerEntry.question_template_id)
+        .subquery()
+    )
+
     rows = session.execute(
         select(QuestionTemplate.prompt_text, AnswerEntry)
         .join(AnswerEntry, AnswerEntry.question_template_id == QuestionTemplate.id)
-        .where(
-            QuestionTemplate.account_id == account_id,
-            AnswerEntry.account_id == account_id,
-        )
-        .order_by(AnswerEntry.created_at.desc())
+        .join(latest, (latest.c.question_template_id == AnswerEntry.question_template_id)
+              & (latest.c.max_created_at == AnswerEntry.created_at))
+        .where(QuestionTemplate.account_id == account_id)
     ).all()
 
-    seen: set[str] = set()
     answers: dict[str, Any] = {}
     for prompt_text, entry in rows:
-        if prompt_text in seen:
-            continue
-        seen.add(prompt_text)
         payload = entry.answer_payload or {}
         if "values" in payload:
             answers[prompt_text] = payload["values"]
