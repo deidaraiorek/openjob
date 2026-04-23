@@ -38,16 +38,14 @@ _SUBMIT_BUTTON_TEXTS = {
 
 _SKIP_INPUT_TYPES = {"hidden", "submit", "reset", "button", "image", "file"}
 
-_LABEL_SIMILARITY_THRESHOLD = 0.6
+_LABEL_SIMILARITY_THRESHOLD = 0.8
 
 
 def _best_answer(label: str, answers: dict[str, Any]) -> Any | None:
     label_lower = label.lower().strip()
-
     for key, val in answers.items():
         if key.lower().strip() == label_lower:
             return val
-
     best_score = 0.0
     best_val = None
     for key, val in answers.items():
@@ -55,7 +53,6 @@ def _best_answer(label: str, answers: dict[str, Any]) -> Any | None:
         if score > best_score:
             best_score = score
             best_val = val
-
     if best_score >= _LABEL_SIMILARITY_THRESHOLD:
         return best_val
     return None
@@ -63,14 +60,6 @@ def _best_answer(label: str, answers: dict[str, Any]) -> Any | None:
 
 def _get_label_for_element(page: Any, element: Any) -> str:
     try:
-        el_id = element.get_attribute("id")
-        if el_id:
-            label_el = page.locator(f'label[for="{el_id}"]')
-            if label_el.count() > 0:
-                text = label_el.first.inner_text().strip()
-                if text:
-                    return text
-
         aria_label = element.get_attribute("aria-label") or ""
         if aria_label.strip():
             return aria_label.strip()
@@ -83,6 +72,28 @@ def _get_label_for_element(page: Any, element: Any) -> str:
                     text = ref.first.inner_text().strip()
                     if text:
                         return text
+
+        el_id = element.get_attribute("id")
+        if el_id:
+            label_el = page.locator(f'label[for="{el_id}"]')
+            if label_el.count() > 0:
+                text = label_el.first.inner_text().strip().rstrip("*").strip()
+                if text:
+                    return text
+
+        # Walk up to find a .field-label sibling in the parent container
+        parent_label = element.evaluate("""el => {
+            let node = el.parentElement;
+            for (let i = 0; i < 4; i++) {
+                if (!node) break;
+                const lbl = node.querySelector('label.field-label, legend, .label, [class*="label"]');
+                if (lbl && lbl !== el) return lbl.innerText.trim().replace(/\\s*\\*\\s*$/, '');
+                node = node.parentElement;
+            }
+            return '';
+        }""")
+        if parent_label and parent_label.strip():
+            return parent_label.strip()
 
         placeholder = element.get_attribute("placeholder") or ""
         if placeholder.strip():
@@ -107,19 +118,35 @@ def _is_required(element: Any) -> bool:
     return False
 
 
+def _get_tag(element: Any) -> str:
+    try:
+        return element.evaluate("el => el.tagName.toLowerCase()")
+    except Exception:
+        return "input"
+
+
 def _fill_page(page: Any, answers: dict[str, Any]) -> list[FilledField]:
     missing: list[FilledField] = []
+    seen_names: set[str] = set()
 
     inputs = page.locator("input, select, textarea").all()
     for el in inputs:
         try:
+            tag = _get_tag(el)
             input_type = (el.get_attribute("type") or "text").lower()
-            if input_type in _SKIP_INPUT_TYPES:
+
+            if tag == "input" and input_type in _SKIP_INPUT_TYPES:
                 continue
             if not el.is_visible():
                 continue
 
-            tag = el.evaluate("el => el.tagName.toLowerCase()")
+            # For radio/checkbox, deduplicate by name — only process once per group
+            if input_type in ("radio", "checkbox"):
+                name = el.get_attribute("name") or ""
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+
             label = _get_label_for_element(page, el)
             if not label:
                 continue
@@ -141,7 +168,7 @@ def _fill_page(page: Any, answers: dict[str, Any]) -> list[FilledField]:
             elif input_type == "checkbox":
                 _fill_checkbox(el, answer)
             elif input_type == "radio":
-                _fill_radio(page, el, label, answer)
+                _fill_radio(page, el, answer)
             elif input_type == "file":
                 pass
             else:
@@ -177,22 +204,48 @@ def _fill_checkbox(el: Any, answer: Any) -> None:
         el.uncheck()
 
 
-def _fill_radio(page: Any, el: Any, label: str, answer: Any) -> None:
+def _get_radio_option_label(radio: Any) -> str:
+    try:
+        # For <label><input type="radio"> Option text</label>, get parent label text
+        # minus any nested input element text
+        text = radio.evaluate("""el => {
+            const parent = el.closest('label');
+            if (parent) {
+                const clone = parent.cloneNode(true);
+                clone.querySelectorAll('input').forEach(i => i.remove());
+                return clone.innerText.trim();
+            }
+            // value attribute as fallback
+            return el.getAttribute('value') || '';
+        }""")
+        if text and text.strip():
+            return text.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _fill_radio(page: Any, el: Any, answer: Any) -> None:
     answer_str = str(answer).lower().strip()
     name = el.get_attribute("name") or ""
-    if name:
-        radios = page.locator(f'input[type="radio"][name="{name}"]').all()
-        for radio in radios:
-            radio_label = _get_label_for_element(page, radio)
-            if radio_label.lower().strip() == answer_str:
-                radio.check()
-                return
-        for radio in radios:
-            radio_label = _get_label_for_element(page, radio)
-            score = difflib.SequenceMatcher(None, answer_str, radio_label.lower().strip()).ratio()
-            if score >= _LABEL_SIMILARITY_THRESHOLD:
-                radio.check()
-                return
+    if not name:
+        return
+    radios = page.locator(f'input[type="radio"][name="{name}"]').all()
+    for radio in radios:
+        radio_label = _get_radio_option_label(radio)
+        if radio_label.lower().strip() == answer_str:
+            radio.check()
+            return
+    best_score = 0.0
+    best_radio = None
+    for radio in radios:
+        radio_label = _get_radio_option_label(radio)
+        score = difflib.SequenceMatcher(None, answer_str, radio_label.lower().strip()).ratio()
+        if score > best_score:
+            best_score = score
+            best_radio = radio
+    if best_score >= _LABEL_SIMILARITY_THRESHOLD and best_radio:
+        best_radio.check()
 
 
 def _click_button_by_text(page: Any, texts: set[str]) -> bool:
@@ -222,21 +275,30 @@ def _click_button_by_text(page: Any, texts: set[str]) -> bool:
 
 
 def fill_and_submit(page: Any, answers: dict[str, Any], *, max_steps: int = 20) -> FillResult:
-    all_missing: list[FilledField] = []
-
     for _ in range(max_steps):
         missing = _fill_page(page, answers)
-        all_missing = missing
 
         if missing:
             return FillResult(submitted=False, missing_fields=missing)
+
+        url_before = page.url
 
         if _click_button_by_text(page, _SUBMIT_BUTTON_TEXTS):
             try:
                 page.wait_for_load_state("networkidle", timeout=10_000)
             except Exception:
                 pass
-            return FillResult(submitted=True)
+
+            if page.url != url_before:
+                return FillResult(submitted=True)
+
+            # URL didn't change — browser validation blocked the submit.
+            # Find any visible validation messages or required fields that are invalid.
+            invalid_fields = _collect_invalid_fields(page)
+            if invalid_fields:
+                return FillResult(submitted=False, missing_fields=invalid_fields)
+
+            raise DOMFillError("Submit clicked but page did not navigate — possible validation failure")
 
         if _click_button_by_text(page, _NEXT_BUTTON_TEXTS):
             try:
@@ -248,3 +310,47 @@ def fill_and_submit(page: Any, answers: dict[str, Any], *, max_steps: int = 20) 
         break
 
     raise DOMFillError("Could not find Submit or Next button on the page")
+
+
+def _collect_invalid_fields(page: Any) -> list[FilledField]:
+    raw = page.evaluate("""() => {
+        const results = [];
+        const seen = new Set();
+        for (const el of document.querySelectorAll('input, select, textarea')) {
+            if (!el.validity || el.validity.valid) continue;
+            if (!el.offsetParent) continue;
+            const name = el.name || el.id || '';
+            if (seen.has(name)) continue;
+            seen.add(name);
+            const type = el.tagName === 'SELECT' ? 'select'
+                       : el.tagName === 'TEXTAREA' ? 'textarea'
+                       : (el.type || 'text');
+            let label = el.getAttribute('aria-label') || '';
+            if (!label && el.id) {
+                const lbl = document.querySelector('label[for="' + el.id + '"]');
+                if (lbl) label = lbl.innerText.trim().replace(/\\s*\\*\\s*$/, '');
+            }
+            if (!label) {
+                let node = el.parentElement;
+                for (let i = 0; i < 4; i++) {
+                    if (!node) break;
+                    const lbl = node.querySelector('label.field-label, legend');
+                    if (lbl) { label = lbl.innerText.trim().replace(/\\s*\\*\\s*$/, ''); break; }
+                    node = node.parentElement;
+                }
+            }
+            if (!label) label = name.replace(/_/g, ' ');
+            results.push({ label, field_type: type, required: true, options: [], placeholder: null });
+        }
+        return results;
+    }""")
+    return [
+        FilledField(
+            label=r["label"],
+            field_type=r["field_type"],
+            required=r["required"],
+            options=r.get("options", []),
+            placeholder=r.get("placeholder"),
+        )
+        for r in (raw or [])
+    ]
