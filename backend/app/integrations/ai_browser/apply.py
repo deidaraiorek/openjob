@@ -20,6 +20,8 @@ from app.domains.questions.fingerprints import ApplyQuestion
 from app.domains.questions.matching import build_question_answer_map, ensure_question_task, resolve_questions
 from app.domains.logs.service import log_system_event
 from app.integrations.ai_browser.blockers import AIBrowserBlocker, classify_ai_browser_exception
+from app.integrations.dom_scraper.ats_detect import is_supported as ats_is_supported
+from app.integrations.dom_scraper.filler import DOMFillError, FillResult, fill_and_submit
 from app.integrations.linkedin.artifacts import persist_artifacts
 from app.integrations.linkedin.session_store import ensure_profile_dir
 
@@ -210,6 +212,45 @@ def _parse_extracted_fields(fields: list[ExtractedField]) -> list[ApplyQuestion]
     return questions
 
 
+def _run_dom_apply(url: str, answers_by_key: dict[str, Any], credential: str | None, settings: Settings) -> ApplyOutput:
+    from playwright.sync_api import sync_playwright
+    from app.integrations.browser_context import _CHROMIUM_ARGS, _NAVIGATOR_WEBDRIVER_SCRIPT
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=settings.playwright_headless, args=_CHROMIUM_ARGS)
+        context = browser.new_context()
+        context.add_init_script(_NAVIGATOR_WEBDRIVER_SCRIPT)
+        context.set_default_timeout(settings.playwright_timeout_ms)
+        page = context.new_page()
+
+        try:
+            page.goto(url, wait_until="networkidle")
+
+            if credential:
+                pass
+
+            result = fill_and_submit(page, answers_by_key)
+
+            if result.submitted:
+                return ApplyOutput(submitted=True)
+
+            return ApplyOutput(
+                submitted=False,
+                missing_fields=[
+                    ExtractedField(
+                        label=f.label,
+                        field_type=f.field_type,
+                        required=f.required,
+                        options=f.options,
+                        placeholder=f.placeholder,
+                    )
+                    for f in result.missing_fields
+                ],
+            )
+        finally:
+            browser.close()
+
+
 def _select_target(job: Job, destination_url: str | None) -> ApplyTarget:
     if destination_url:
         for t in job.apply_targets:
@@ -270,7 +311,15 @@ def execute_ai_browser_run(
     try:
         answers_by_key = _load_all_answers(session, account.id)
 
-        result = _run_apply_agent(resolved_url, answers_by_key, credential, resolved_settings)
+        if ats_is_supported(resolved_url):
+            try:
+                result = _run_dom_apply(resolved_url, answers_by_key, credential, resolved_settings)
+                _log_event(run, "dom_apply_attempted", {"driver": "dom_scraper", "url": resolved_url}, session)
+            except Exception:
+                result = _run_apply_agent(resolved_url, answers_by_key, credential, resolved_settings)
+                _log_event(run, "dom_apply_fallback", {"driver": "ai_browser", "url": resolved_url}, session)
+        else:
+            result = _run_apply_agent(resolved_url, answers_by_key, credential, resolved_settings)
 
         if result.submitted:
             run.status = "submitted"
