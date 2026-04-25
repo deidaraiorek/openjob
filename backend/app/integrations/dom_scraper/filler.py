@@ -155,10 +155,10 @@ def _fill_page(page: Any, answers: dict[str, Any]) -> list[FilledField]:
                     ))
                 continue
 
-            if tag == "select":
-                _fill_select(el, answer)
-            elif role == "combobox":
+            if role == "combobox":
                 _fill_combobox(page, el, answer)
+            elif tag == "select":
+                _fill_select(el, answer)
             elif input_type == "checkbox":
                 _fill_checkbox(el, answer)
             elif input_type == "radio":
@@ -176,17 +176,62 @@ def _fill_page(page: Any, answers: dict[str, Any]) -> list[FilledField]:
 def _fill_combobox(page: Any, el: Any, answer: Any) -> None:
     answer_str = str(answer).lower().strip()
     try:
+        # Find the listbox associated with this combobox via aria-controls or by
+        # looking for a sibling/child [role=listbox]
+        listbox_id = el.get_attribute("aria-controls") or ""
         el.click()
-        # Wait for listbox options to appear
-        page.wait_for_selector("[role='option'], [role='listbox'] li", timeout=3_000)
-        options = page.locator("[role='option'], [role='listbox'] li").all()
-        for opt in options:
-            opt_text = (opt.inner_text() or "").strip().lower()
-            if opt_text == answer_str or answer_str in opt_text:
-                opt.click()
+
+        if listbox_id:
+            listbox = page.locator(f"#{listbox_id}")
+            listbox.wait_for(state="visible", timeout=3_000)
+            options = listbox.locator("[role='option'], li").all()
+        else:
+            # Fall back: find a visible listbox that appeared after the click
+            page.wait_for_selector("[role='listbox']:not([style*='display: none'])", timeout=3_000)
+            # Get the listbox nearest to this element
+            listbox = el.evaluate_handle("""el => {
+                const id = el.getAttribute('aria-controls');
+                if (id) return document.getElementById(id);
+                let node = el.nextElementSibling;
+                while (node) {
+                    if (node.getAttribute('role') === 'listbox') return node;
+                    node = node.nextElementSibling;
+                }
+                let parent = el.parentElement;
+                for (let i = 0; i < 3; i++) {
+                    if (!parent) break;
+                    const lb = parent.querySelector('[role=listbox]');
+                    if (lb) return lb;
+                    parent = parent.parentElement;
+                }
+                return null;
+            }""")
+            if not listbox:
+                el.press("Escape")
                 return
-        # No match — close the dropdown by pressing Escape
-        el.press("Escape")
+            options = page.locator("[role='listbox']:not([style*='display: none']) [role='option'], [role='listbox']:not([style*='display: none']) li").all()
+
+        chosen_text: str | None = None
+        for opt in options:
+            opt_text = (opt.inner_text() or "").strip()
+            if opt_text.lower() == answer_str or answer_str in opt_text.lower():
+                opt.click()
+                chosen_text = opt_text
+                break
+
+        if chosen_text:
+            el.evaluate("""(el, val) => {
+                el.value = val;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }""", chosen_text)
+        else:
+            el.press("Escape")
+
+        # Force-close all open listboxes
+        page.evaluate("""() => {
+            document.querySelectorAll('[role="listbox"]').forEach(el => el.style.display = 'none');
+        }""")
     except Exception:
         pass
 
@@ -268,7 +313,7 @@ def _click_button_by_text(page: Any, texts: set[str]) -> bool:
                 continue
             text = (btn.inner_text() or "").strip().lower()
             if text in texts:
-                btn.click()
+                btn.click(timeout=5_000)
                 return True
         except Exception:
             continue
@@ -279,7 +324,7 @@ def _click_button_by_text(page: Any, texts: set[str]) -> bool:
             text = (btn.inner_text() or "").strip().lower()
             for t in texts:
                 if t in text:
-                    btn.click()
+                    btn.click(timeout=5_000)
                     return True
         except Exception:
             continue
@@ -293,6 +338,15 @@ def fill_and_submit(page: Any, answers: dict[str, Any], *, max_steps: int = 20) 
         if missing:
             return FillResult(submitted=False, missing_fields=missing)
 
+        # Close any open dropdowns (combobox listboxes) that may overlay buttons
+        try:
+            page.evaluate("""() => {
+                if (document.activeElement) document.activeElement.blur();
+                document.querySelectorAll('[role="listbox"]').forEach(el => el.style.display = 'none');
+            }""")
+        except Exception:
+            pass
+
         url_before = page.url
 
         if _click_button_by_text(page, _SUBMIT_BUTTON_TEXTS):
@@ -301,11 +355,13 @@ def fill_and_submit(page: Any, answers: dict[str, Any], *, max_steps: int = 20) 
             except Exception:
                 pass
 
-            if page.url != url_before:
+            # Check for navigation: URL change OR form no longer present (same-URL POST success)
+            url_changed = page.url != url_before
+            form_gone = page.locator("form").count() == 0
+            if url_changed or form_gone:
                 return FillResult(submitted=True)
 
-            # URL didn't change — browser validation blocked the submit.
-            # Find any visible validation messages or required fields that are invalid.
+            # URL didn't change and form still present — browser validation blocked the submit.
             invalid_fields = _collect_invalid_fields(page)
             if invalid_fields:
                 return FillResult(submitted=False, missing_fields=invalid_fields)
