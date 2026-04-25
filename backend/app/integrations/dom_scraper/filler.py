@@ -118,25 +118,26 @@ def _get_tag(element: Any) -> str:
 
 def _fill_page(page: Any, answers: dict[str, Any]) -> list[FilledField]:
     missing: list[FilledField] = []
-    seen_names: set[str] = set()
+    seen_radio_names: set[str] = set()
 
-    inputs = page.locator("input, select, textarea").all()
+    inputs = page.locator("input, select, textarea, [role='combobox']").all()
     for el in inputs:
         try:
             tag = _get_tag(el)
             input_type = (el.get_attribute("type") or "text").lower()
+            role = (el.get_attribute("role") or "").lower()
 
             if tag == "input" and input_type in _SKIP_INPUT_TYPES:
                 continue
             if not el.is_visible():
                 continue
 
-            # For radio/checkbox, deduplicate by name — only process once per group
-            if input_type in ("radio", "checkbox"):
+            # Deduplicate radio groups by name — only process the first radio in each group
+            if input_type == "radio":
                 name = el.get_attribute("name") or ""
-                if name in seen_names:
+                if not name or name in seen_radio_names:
                     continue
-                seen_names.add(name)
+                seen_radio_names.add(name)
 
             label = _get_label_for_element(page, el)
             if not label:
@@ -156,6 +157,8 @@ def _fill_page(page: Any, answers: dict[str, Any]) -> list[FilledField]:
 
             if tag == "select":
                 _fill_select(el, answer)
+            elif role == "combobox":
+                _fill_combobox(page, el, answer)
             elif input_type == "checkbox":
                 _fill_checkbox(el, answer)
             elif input_type == "radio":
@@ -168,6 +171,24 @@ def _fill_page(page: Any, answers: dict[str, Any]) -> list[FilledField]:
             continue
 
     return missing
+
+
+def _fill_combobox(page: Any, el: Any, answer: Any) -> None:
+    answer_str = str(answer).lower().strip()
+    try:
+        el.click()
+        # Wait for listbox options to appear
+        page.wait_for_selector("[role='option'], [role='listbox'] li", timeout=3_000)
+        options = page.locator("[role='option'], [role='listbox'] li").all()
+        for opt in options:
+            opt_text = (opt.inner_text() or "").strip().lower()
+            if opt_text == answer_str or answer_str in opt_text:
+                opt.click()
+                return
+        # No match — close the dropdown by pressing Escape
+        el.press("Escape")
+    except Exception:
+        pass
 
 
 def _fill_select(el: Any, answer: Any) -> None:
