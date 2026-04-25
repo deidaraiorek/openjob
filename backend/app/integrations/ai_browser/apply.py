@@ -20,7 +20,7 @@ from app.domains.questions.fingerprints import ApplyQuestion
 from app.domains.questions.matching import build_question_answer_map, ensure_question_task, resolve_questions
 from app.domains.logs.service import log_system_event
 from app.integrations.ai_browser.blockers import AIBrowserBlocker, classify_ai_browser_exception
-from app.integrations.dom_scraper.ats_detect import is_supported as ats_is_supported
+from app.integrations.dom_scraper.ats_detect import is_supported as ats_is_supported, resolve_apply_url
 from app.integrations.dom_scraper.filler import DOMFillError, FillResult, fill_and_submit
 from app.integrations.linkedin.artifacts import persist_artifacts
 from app.integrations.linkedin.session_store import ensure_profile_dir
@@ -217,6 +217,8 @@ def _run_dom_apply(url: str, answers_by_key: dict[str, Any], settings: Settings)
     from playwright.sync_api import sync_playwright
     from app.integrations.browser_context import _CHROMIUM_ARGS, _NAVIGATOR_WEBDRIVER_SCRIPT
 
+    apply_url = resolve_apply_url(url)
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=settings.playwright_headless, args=_CHROMIUM_ARGS)
         context = browser.new_context()
@@ -225,7 +227,7 @@ def _run_dom_apply(url: str, answers_by_key: dict[str, Any], settings: Settings)
         page = context.new_page()
 
         try:
-            page.goto(url, wait_until="domcontentloaded")
+            page.goto(apply_url, wait_until="domcontentloaded")
             page.wait_for_selector("input, select, textarea", timeout=10_000)
 
             result = fill_and_submit(page, answers_by_key)

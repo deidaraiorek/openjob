@@ -29,3 +29,18 @@ def detect_ats(url: str) -> str | None:
 
 def is_supported(url: str) -> bool:
     return detect_ats(url) is not None
+
+
+def resolve_apply_url(url: str) -> str:
+    """Transform a job listing URL to its direct application form URL if needed."""
+    ats = detect_ats(url)
+    if ats == "ashby":
+        # jobs.ashbyhq.com/<company>/<job-id> → jobs.ashbyhq.com/<company>/<job-id>/application
+        # app.ashbyhq.com/jobs/<company>/<job-id> → same pattern
+        if not url.rstrip("/").endswith("/application"):
+            return url.rstrip("/") + "/application"
+    if ats == "lever":
+        # jobs.lever.co/<company>/<job-id> → jobs.lever.co/<company>/<job-id>/apply
+        if not url.rstrip("/").endswith("/apply"):
+            return url.rstrip("/") + "/apply"
+    return url
