@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import Settings, get_settings
@@ -20,6 +20,8 @@ from app.domains.questions.fingerprints import ApplyQuestion
 from app.domains.questions.matching import build_question_answer_map, ensure_question_task, resolve_questions
 from app.domains.logs.service import log_system_event
 from app.integrations.ai_browser.blockers import AIBrowserBlocker, classify_ai_browser_exception
+from app.integrations.dom_scraper.ats_detect import is_supported as ats_is_supported, resolve_apply_url
+from app.integrations.dom_scraper.filler import DOMFillError, FillResult, fill_and_submit
 from app.integrations.linkedin.artifacts import persist_artifacts
 from app.integrations.linkedin.session_store import ensure_profile_dir
 
@@ -50,8 +52,9 @@ class ExtractedField(BaseModel):
     placeholder: str | None = None
 
 
-class InspectOutput(BaseModel):
-    questions: list[ExtractedField]
+class ApplyOutput(BaseModel):
+    submitted: bool
+    missing_fields: list[ExtractedField] = Field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -109,39 +112,25 @@ _OPTIONAL_URL_FIELD_KEYWORDS = {
     "linkedin", "twitter", "github", "portfolio", "website", "url", "blog", "other link"}
 
 
-def _build_inspect_task(url: str, credential: str | None) -> str:
-    return (
-        f"Navigate to this job application page: {url}\n\n"
-        "Your task is to INSPECT the application form only — do NOT fill in or submit anything.\n\n"
-        "Extract every visible form field from the application form. For each field, record:\n"
-        "- label: the human-readable label or question text\n"
-        "- field_type: one of 'text', 'textarea', 'select', 'checkbox', 'radio', 'file', 'email', 'tel'\n"
-        "- required: true for ANY field that the applicant must answer to successfully submit — "
-        "this includes fields marked with *, fields that are substantive questions (work authorization, "
-        "location preferences, employment type, eligibility questions), and file uploads. "
-        "- options: list of option labels for select/radio/checkbox fields, empty list otherwise\n"
-        "- placeholder: the placeholder text shown inside the input field, or null if there is none\n\n"
-        "If the form has multiple steps or pages, navigate through all steps to discover all fields "
-        "but do NOT fill anything in.\n\n"
-        "Return the complete list of fields as structured output."
-        + _credential_block(credential)
-    )
-
-
-def _build_submit_task(url: str, answers_by_key: dict[str, Any], credential: str | None) -> str:
+def _build_apply_task(url: str, answers_by_key: dict[str, Any], credential: str | None) -> str:
     answers_json = json.dumps(answers_by_key, indent=2)
     return (
         f"Navigate to this job application page: {url}\n\n"
-        "Your task is to fill in and submit the job application form using ONLY the answers provided below.\n\n"
-        f"Available answers:\n{answers_json}\n\n"
-        "IMPORTANT RULES:\n"
-        "- Do NOT fill any field for which you do not have a provided answer\n"
-        "- Do NOT invent, guess, or hallucinate any values\n"
-        "- Match each answer to the form field by its label or purpose\n"
-        "- For multi-step forms, complete each step in order and click Next/Continue to advance\n"
-        "- After filling all available fields, click the final Submit button\n"
-        "- If you encounter a CAPTCHA, stop and report it\n\n"
-        "Complete the submission."
+        "Your task is to fill in and submit the job application form.\n\n"
+        f"You have these answers available:\n{answers_json}\n\n"
+        "INSTRUCTIONS:\n"
+        "1. Scan the entire form first. Identify every required field (marked with * or required attribute).\n"
+        "2. For each required field, check if you have a matching answer. File upload fields (resume, CV) count as required — you cannot fill them, so add them to missing_fields immediately.\n"
+        "3. If any required field has no answer (including file uploads), STOP. Do NOT click Submit. Record all such fields in missing_fields and set submitted=false.\n"
+        "4. Only if ALL required fields are answered, fill the form and click Submit.\n"
+        "5. After clicking Submit: if the page changes to a confirmation/success page, set submitted=true. If the page does NOT change (browser validation blocked it), identify which fields are highlighted as invalid and add them to missing_fields, set submitted=false.\n"
+        "6. Do NOT click Submit more than once. If submit is blocked, stop immediately and report missing fields.\n"
+        "7. For multi-step forms, complete each step and click Next/Continue to advance.\n"
+        "8. If you encounter a CAPTCHA, stop and report it in missing_fields.\n\n"
+        "Return structured output with:\n"
+        "- submitted: true only if the page navigated to a success/confirmation page after submit\n"
+        "- missing_fields: every required field you could not fill (file uploads, unanswered fields, validation failures)\n"
+        "  For each missing field include: label, field_type, required=true, options (if select/radio/checkbox), placeholder"
         + _credential_block(credential)
     )
 
@@ -159,11 +148,16 @@ async def _strip_dom(agent) -> None:
         pass
 
 
-def _run_inspect_agent(url: str, credential: str | None, settings: Settings) -> list[ApplyQuestion]:
+def _run_apply_agent(
+    url: str,
+    answers_by_key: dict[str, Any],
+    credential: str | None,
+    settings: Settings,
+) -> ApplyOutput:
     from browser_use import Agent, Browser
 
     llm = _build_llm(settings)
-    task = _build_inspect_task(url, credential)
+    task = _build_apply_task(url, answers_by_key, credential)
 
     async def _run():
         browser = Browser(headless=settings.playwright_headless)
@@ -171,81 +165,43 @@ def _run_inspect_agent(url: str, credential: str | None, settings: Settings) -> 
             task=task,
             llm=llm,
             browser=browser,
-            output_model_schema=InspectOutput,
+            output_model_schema=ApplyOutput,
         )
-        return await agent.run(max_steps=50, on_step_start=_strip_dom)
+        return await agent.run(max_steps=100, on_step_start=_strip_dom)
 
     history = _run_sync(_run())
 
     raw = history.final_result()
     if not raw:
         structured_fn = getattr(history, "structured_output", None)
-        structured = structured_fn() if callable(structured_fn) else None
-        if not structured:
-            raise AIBrowserBlocker(
-                code="no_form_found",
-                step="inspect",
-                message="AI browser agent could not find any form fields on the page.",
-            )
-        raw = structured
+        raw = structured_fn() if callable(structured_fn) else None
+
+    if not raw:
+        raise AIBrowserBlocker(
+            code="no_form_found",
+            step="apply",
+            message="AI browser agent returned no output.",
+        )
 
     try:
-        output = InspectOutput.model_validate_json(raw) if isinstance(
-            raw, str) else InspectOutput.model_validate(raw)
+        return ApplyOutput.model_validate_json(raw) if isinstance(raw, str) else ApplyOutput.model_validate(raw)
     except Exception:
         raise AIBrowserBlocker(
             code="no_form_found",
-            step="inspect",
+            step="apply",
             message=f"AI browser agent returned unparseable output: {raw!r}",
         )
-
-    if not output.questions:
-        raise AIBrowserBlocker(
-            code="no_form_found",
-            step="inspect",
-            message="AI browser agent found zero form fields.",
-        )
-
-    return _parse_extracted_fields(output.questions)
-
-
-def _run_submit_agent(
-    url: str,
-    answers_by_key: dict[str, Any],
-    credential: str | None,
-    settings: Settings,
-) -> dict[str, Any]:
-    from browser_use import Agent, Browser
-
-    llm = _build_llm(settings)
-    task = _build_submit_task(url, answers_by_key, credential)
-
-    async def _run():
-        browser = Browser(headless=settings.playwright_headless)
-        agent = Agent(
-            task=task,
-            llm=llm,
-            browser=browser,
-        )
-        return await agent.run(max_steps=100, on_step_start=_strip_dom)
-
-    history = _run_sync(_run())
-
-    return {"action_count": len(history.action_names()), "final_result": history.final_result()}
 
 
 def _parse_extracted_fields(fields: list[ExtractedField]) -> list[ApplyQuestion]:
     questions = []
     for q in fields:
         label_lower = q.label.lower()
-        is_optional_url = any(
-            kw in label_lower for kw in _OPTIONAL_URL_FIELD_KEYWORDS)
+        is_optional_url = any(kw in label_lower for kw in _OPTIONAL_URL_FIELD_KEYWORDS)
         is_eeo_voluntary = any(kw in label_lower for kw in {
-                               "gender", "race", "ethnicity", "veteran", "disability", "eeo", "diversity"})
-        is_substantive_choice = q.field_type in {
-            "radio", "select", "checkbox"} and len(q.options) > 0
-        required = q.required or (
-            is_substantive_choice and not is_optional_url and not is_eeo_voluntary)
+            "gender", "race", "ethnicity", "veteran", "disability", "eeo", "diversity"})
+        is_substantive_choice = q.field_type in {"radio", "select", "checkbox"} and len(q.options) > 0
+        required = q.required or (is_substantive_choice and not is_optional_url and not is_eeo_voluntary)
         questions.append(ApplyQuestion(
             key=q.label.lower().replace(" ", "_")[:64],
             prompt_text=q.label,
@@ -257,13 +213,51 @@ def _parse_extracted_fields(fields: list[ExtractedField]) -> list[ApplyQuestion]
     return questions
 
 
+def _run_dom_apply(url: str, answers_by_key: dict[str, Any], settings: Settings) -> ApplyOutput:
+    from playwright.sync_api import sync_playwright
+    from app.integrations.browser_context import _CHROMIUM_ARGS, _NAVIGATOR_WEBDRIVER_SCRIPT
+
+    apply_url = resolve_apply_url(url)
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=settings.playwright_headless, args=_CHROMIUM_ARGS)
+        context = browser.new_context()
+        context.add_init_script(_NAVIGATOR_WEBDRIVER_SCRIPT)
+        context.set_default_timeout(settings.playwright_timeout_ms)
+        page = context.new_page()
+
+        try:
+            page.goto(apply_url, wait_until="domcontentloaded")
+            page.wait_for_selector("input, select, textarea", timeout=10_000)
+
+            result = fill_and_submit(page, answers_by_key)
+
+            if result.submitted:
+                return ApplyOutput(submitted=True)
+
+            return ApplyOutput(
+                submitted=False,
+                missing_fields=[
+                    ExtractedField(
+                        label=f.label,
+                        field_type=f.field_type,
+                        required=f.required,
+                        options=f.options,
+                        placeholder=f.placeholder,
+                    )
+                    for f in result.missing_fields
+                ],
+            )
+        finally:
+            browser.close()
+
+
 def _select_target(job: Job, destination_url: str | None) -> ApplyTarget:
     if destination_url:
         for t in job.apply_targets:
             if t.destination_url == destination_url:
                 return t
-        raise TerminalApplyError(
-            f"No apply target found with destination URL: {destination_url}")
+        raise TerminalApplyError(f"No apply target found with destination URL: {destination_url}")
     preferred = next((t for t in job.apply_targets if t.is_preferred), None)
     if preferred:
         return preferred
@@ -309,26 +303,51 @@ def execute_ai_browser_run(
         _log_event(
             run,
             "queued",
-            {"apply_target_id": apply_target.id,
-                "target_type": apply_target.target_type, "driver": "ai_browser"},
+            {"apply_target_id": apply_target.id, "target_type": apply_target.target_type, "driver": "ai_browser"},
             session,
         )
 
-    profile_dir = ensure_profile_dir(
-        account.id, "ai_browser", settings=resolved_settings)
+    ensure_profile_dir(account.id, "ai_browser", settings=resolved_settings)
 
     try:
-        questions = _run_inspect_agent(
-            resolved_url, credential, resolved_settings)
-        _log_event(run, "questions_fetched", {
-                   "question_count": len(questions), "driver": "ai_browser"}, session)
+        answers_by_key = _load_all_answers(session, account.id)
 
-        resolved_questions = resolve_questions(session, account.id, questions)
+        if ats_is_supported(resolved_url):
+            try:
+                result = _run_dom_apply(resolved_url, answers_by_key, resolved_settings)
+                _log_event(run, "dom_apply_attempted", {"driver": "dom_scraper", "url": resolved_url}, session)
+            except Exception as e:
+                _log_event(run, "dom_apply_failed", {"error": str(e), "driver": "dom_scraper"}, session)
+                result = _run_apply_agent(resolved_url, answers_by_key, credential, resolved_settings)
+                _log_event(run, "dom_apply_fallback", {"driver": "ai_browser", "url": resolved_url}, session)
+        else:
+            result = _run_apply_agent(resolved_url, answers_by_key, credential, resolved_settings)
+
+        if result.submitted:
+            run.status = "submitted"
+            run.completed_at = utcnow()
+            job.status = "applied"
+            _log_event(
+                run,
+                "submitted",
+                {"driver": "ai_browser", "submit_result": redact_payload({"submitted": True})},
+                session,
+            )
+            session.commit()
+            return AIBrowserResult(
+                application_run_id=run.id,
+                status=run.status,
+                answer_entry_ids=[],
+                created_question_task_ids=[],
+            )
+
+        missing = _parse_extracted_fields(result.missing_fields)
+        _log_event(run, "questions_fetched", {"question_count": len(missing), "driver": "ai_browser"}, session)
+
+        resolved_questions = resolve_questions(session, account.id, missing)
         answer_entry_ids = [
             item.answer_entry.id for item in resolved_questions if item.answer_entry is not None
         ]
-        unresolved = [item for item in resolved_questions if item.answer_entry is None]
-        unresolved_required = [item for item in unresolved if item.question.required]
         task_ids = [
             ensure_question_task(
                 session,
@@ -337,48 +356,18 @@ def execute_ai_browser_run(
                 application_run_id=run.id,
                 resolved_question=item,
             ).id
-            for item in unresolved
+            for item in resolved_questions
+            if item.answer_entry is None
         ]
 
-        if unresolved_required:
-            run.status = "blocked_missing_answer"
-            run.completed_at = utcnow()
-            _log_event(
-                run,
-                "blocked_missing_answer",
-                {
-                    "question_task_ids": task_ids,
-                    "question_answer_map": build_question_answer_map(resolved_questions),
-                },
-                session,
-            )
-            session.commit()
-            return AIBrowserResult(
-                application_run_id=run.id,
-                status=run.status,
-                answer_entry_ids=answer_entry_ids,
-                created_question_task_ids=task_ids,
-            )
-
-        answers_by_key = {
-            item.question.prompt_text: item.answer_value
-            for item in resolved_questions
-            if item.answer_entry is not None
-        }
-
-        submit_result = _run_submit_agent(
-            resolved_url, answers_by_key, credential, resolved_settings)
-        run.status = "submitted"
+        run.status = "blocked_missing_answer"
         run.completed_at = utcnow()
-        job.status = "applied"
         _log_event(
             run,
-            "submitted",
+            "blocked_missing_answer",
             {
-                "answer_entry_ids": answer_entry_ids,
+                "question_task_ids": task_ids,
                 "question_answer_map": build_question_answer_map(resolved_questions),
-                "driver": "ai_browser",
-                "submit_result": redact_payload(submit_result),
             },
             session,
         )
@@ -387,7 +376,7 @@ def execute_ai_browser_run(
             application_run_id=run.id,
             status=run.status,
             answer_entry_ids=answer_entry_ids,
-            created_question_task_ids=[],
+            created_question_task_ids=task_ids,
         )
 
     except Exception as error:
@@ -419,3 +408,36 @@ def execute_ai_browser_run(
             answer_entry_ids=[],
             created_question_task_ids=[],
         )
+
+
+def _load_all_answers(session: Session, account_id: int) -> dict[str, Any]:
+    from app.domains.questions.models import AnswerEntry, QuestionTemplate
+
+    latest = (
+        select(
+            AnswerEntry.question_template_id,
+            func.max(AnswerEntry.created_at).label("max_created_at"),
+        )
+        .where(AnswerEntry.account_id == account_id)
+        .group_by(AnswerEntry.question_template_id)
+        .subquery()
+    )
+
+    rows = session.execute(
+        select(QuestionTemplate.prompt_text, AnswerEntry)
+        .join(AnswerEntry, AnswerEntry.question_template_id == QuestionTemplate.id)
+        .join(latest, (latest.c.question_template_id == AnswerEntry.question_template_id)
+              & (latest.c.max_created_at == AnswerEntry.created_at))
+        .where(QuestionTemplate.account_id == account_id)
+    ).all()
+
+    answers: dict[str, Any] = {}
+    for prompt_text, entry in rows:
+        payload = entry.answer_payload or {}
+        if "values" in payload:
+            answers[prompt_text] = payload["values"]
+        elif "value" in payload:
+            answers[prompt_text] = payload["value"]
+        elif entry.answer_text:
+            answers[prompt_text] = entry.answer_text
+    return answers
